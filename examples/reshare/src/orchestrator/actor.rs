@@ -6,8 +6,9 @@ use crate::{
     BLOCKS_PER_EPOCH,
 };
 use commonware_consensus::{
+    elector::Config as Elector,
     marshal::{core::Mailbox as MarshalMailbox, standard::Standard},
-    simplex::{self, elector::Config as Elector, scheme, types::Context, Plan},
+    simplex::{self, scheme, types::Context, Plan},
     types::{Epoch, Epocher, FixedEpocher, ViewDelta},
     CertifiableAutomaton, Relay,
 };

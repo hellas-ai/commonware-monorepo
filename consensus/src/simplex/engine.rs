@@ -1,10 +1,10 @@
 use super::{
     actors::{batcher, resolver, voter},
     config::Config,
-    elector::Config as Elector,
     types::{Activity, Context},
 };
 use crate::{
+    elector::Config as Elector,
     simplex::{scheme::Scheme, Plan},
     CertifiableAutomaton, Relay, Reporter,
 };
