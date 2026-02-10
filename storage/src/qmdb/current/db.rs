@@ -242,10 +242,11 @@ where
     /// Returns a historical proof for the specified range of operations at the given historical
     /// size, along with the operations and their bitmap chunks.
     ///
-    /// The `historical_size` must correspond to a merkleization point (i.e., a bitmap commit
-    /// number). The bitmap state at that point is reconstructed by applying stored reverse
-    /// diffs to build the grafted tree and generate a proof verifiable against the grafted
-    /// root at that historical size.
+    /// The `historical_size` must correspond to a merkleization point (i.e. the operation at
+    /// Location `historical_size` - 1 should be a Commit.
+    /// The bitmap state at that point is reconstructed by applying stored reverse diffs to build
+    /// the grafted MMR and generate a proof verifiable against the grafted root at that
+    /// historical size.
     ///
     /// Historical bitmap diffs are held in memory only, so this method can only reconstruct
     /// states committed since the current process started. After a restart, prior historical
