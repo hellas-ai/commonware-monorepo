@@ -572,4 +572,82 @@ mod test {
     fn assert_mutable_db_commit_is_send(db: MutableCurrentTest) {
         assert_send(db.commit(None));
     }
+
+    #[test_traced("DEBUG")]
+    pub fn test_current_db_historical_range_proofs() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut hasher = StandardHasher::<Sha256>::new();
+            let partition = "historical_proofs".to_string();
+            let db = open_db(context.with_label("db"), partition.clone()).await;
+
+            // Phase 1: Write 50 keys, commit, merkleize.
+            let mut db = db.into_mutable();
+            for i in 0u8..50 {
+                db.write_batch([(Sha256::fill(i), Some(Sha256::fill(i + 100)))])
+                    .await
+                    .unwrap();
+            }
+            let (db, _) = db.commit(None).await.unwrap();
+            let db = db.into_merkleized().await.unwrap();
+            let root1 = db.root();
+            let size1 = db.size();
+
+            // Phase 2: Write 50 more keys, commit, merkleize.
+            let mut db = db.into_mutable();
+            for i in 50u8..100 {
+                db.write_batch([(Sha256::fill(i), Some(Sha256::fill(i + 100)))])
+                    .await
+                    .unwrap();
+            }
+            let (db, _) = db.commit(None).await.unwrap();
+            let db = db.into_merkleized().await.unwrap();
+            let root2 = db.root();
+            let size2 = db.size();
+
+            assert_ne!(root1, root2);
+            assert!(size2 > size1);
+
+            // Historical proof at size1 verifies against root1.
+            let start = Location::new_unchecked(1);
+            let max_ops = NZU64!(4);
+            let (proof, ops, chunks) = db
+                .historical_range_proof(hasher.inner(), size1, start, max_ops)
+                .await
+                .unwrap();
+            assert!(
+                proof.verify(hasher.inner(), start, &ops, &chunks, &root1),
+                "historical proof at size1 should verify against root1"
+            );
+            assert!(
+                !proof.verify(hasher.inner(), start, &ops, &chunks, &root2),
+                "historical proof at size1 should not verify against root2"
+            );
+
+            // Historical proof at size2 verifies against root2.
+            let (proof2, ops2, chunks2) = db
+                .historical_range_proof(hasher.inner(), size2, start, max_ops)
+                .await
+                .unwrap();
+            assert!(
+                proof2.verify(hasher.inner(), start, &ops2, &chunks2, &root2),
+                "historical proof at size2 should verify against root2"
+            );
+            assert!(
+                !proof2.verify(hasher.inner(), start, &ops2, &chunks2, &root1),
+                "historical proof at size2 should not verify against root1"
+            );
+
+            // Nonexistent historical size should error.
+            let bad_size = Location::new_unchecked(*size1 + 1);
+            assert!(
+                db.historical_range_proof(hasher.inner(), bad_size, start, max_ops)
+                    .await
+                    .is_err(),
+                "nonexistent historical size should error"
+            );
+
+            db.destroy().await.unwrap();
+        });
+    }
 }
