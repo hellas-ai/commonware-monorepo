@@ -242,19 +242,22 @@ where
     /// Returns a historical proof for the specified range of operations at the given historical
     /// size, along with the operations and their bitmap chunks.
     ///
-    /// The `historical_size` must correspond to a merkleization point (i.e. the operation at
-    /// Location `historical_size` - 1 should be a Commit.
-    /// The bitmap state at that point is reconstructed by applying stored reverse diffs to build
-    /// the grafted MMR and generate a proof verifiable against the grafted root at that
-    /// historical size.
+    /// `historical_size` must be a merkleization point (i.e. the operation at
+    /// Location `historical_size - 1` should be a Commit). In practice, valid values are
+    /// the `end` bounds returned by previous `commit()` calls within the current process.
     ///
-    /// Historical bitmap diffs are held in memory only, so this method can only reconstruct
-    /// states committed since the current process started. After a restart, prior historical
-    /// sizes will return [Error::NoBitmapCommit].
+    /// The bitmap state at that point is reconstructed by rewinding stored reverse diffs,
+    /// then the grafted MMR is rebuilt so a range proof can be generated that is verifiable
+    /// against the grafted root at that historical size.
+    ///
+    /// Historical bitmap diffs are held in memory only, so this method can only serve sizes
+    /// committed since the current process started. After a restart, prior historical sizes
+    /// will return [Error::NoBitmapCommit].
     ///
     /// # Errors
     ///
-    /// - Returns [Error::NoBitmapCommit] if `historical_size` does not correspond to a bitmap commit.
+    /// - Returns [Error::NoBitmapCommit] if `historical_size` does not correspond to a
+    ///   merkleization point within the current process.
     /// - Returns [mmr::Error::RangeOutOfBounds] if `start_loc` >= `historical_size`.
     pub async fn historical_range_proof(
         &self,
@@ -263,6 +266,12 @@ where
         start_loc: Location,
         max_ops: NonZeroU64,
     ) -> Result<(RangeProof<H::Digest>, Vec<Operation<K, V, U>>, Vec<[u8; N]>), Error> {
+        // Check bounds early: historical_size is the leaf count at the merkleization
+        // point, so start_loc must be within that range.
+        if start_loc >= historical_size {
+            return Err(crate::mmr::Error::RangeOutOfBounds(start_loc).into());
+        }
+
         // Reconstruct the bitmap as it was at `historical_size`.
         let historical_bitmap = self
             .status
@@ -271,9 +280,13 @@ where
 
         // Collect pinned nodes (peaks of the pruned subtree in the grafted MMR).
         //
-        // Grafted leaf digests for completed chunks are immutable (the chunk content
-        // and ops subtree root never change), so the *current* grafted_digests cache
-        // is valid for any historical pruning boundary.
+        // These are guaranteed to exist in `self.grafted_digests` because:
+        // - Historical commits only exist for merkleizations within the current process
+        //   (the bitmap's commits map starts empty at init).
+        // - Entries are never removed from `grafted_digests` during the process.
+        // - The historical bitmap's pruned_chunks >= init-time pruned_chunks (pruning
+        //   only increases), so its peaks are either the init-time pinned nodes or
+        //   internal nodes above them -- both present in the cache.
         let pinned_nodes = self.collect_pinned_nodes(&historical_bitmap)?;
 
         // Rebuild the grafted MMR using the historical bitmap.
@@ -289,13 +302,13 @@ where
         // Generate the range proof over the historical grafted MMR.
         let storage =
             grafting::Storage::new(&grafted_digests, &self.any.log.mmr, grafting::height::<N>());
-        let leaves = Location::new_unchecked(historical_bitmap.len());
-        if start_loc >= leaves {
-            return Err(crate::mmr::Error::RangeOutOfBounds(start_loc).into());
-        }
-        let end_loc = core::cmp::min(start_loc.saturating_add(max_ops.get()), leaves);
-        let proof =
-            mmr::verification::historical_range_proof(&storage, leaves, start_loc..end_loc).await?;
+        let end_loc = core::cmp::min(start_loc.saturating_add(max_ops.get()), historical_size);
+        let proof = mmr::verification::historical_range_proof(
+            &storage,
+            historical_size,
+            start_loc..end_loc,
+        )
+        .await?;
 
         // Compute the partial chunk digest if the last chunk is incomplete.
         //
