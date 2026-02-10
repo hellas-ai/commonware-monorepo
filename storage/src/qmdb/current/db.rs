@@ -242,9 +242,9 @@ where
     /// Returns a historical proof for the specified range of operations at the given historical
     /// size, along with the operations and their bitmap chunks.
     ///
-    /// `historical_size` must be a merkleization point (i.e. the operation at
-    /// Location `historical_size - 1` should be a Commit). In practice, valid values are
-    /// the `end` bounds returned by previous `commit()` calls within the current process.
+    /// `historical_size` must be a value previously returned as `commit().1.end` within
+    /// the current process. That is, it must be the size of the database after a commit
+    /// made since the current process started.
     ///
     /// The bitmap state at that point is reconstructed by rewinding stored reverse diffs,
     /// then the grafted MMR is rebuilt so a range proof can be generated that is verifiable
