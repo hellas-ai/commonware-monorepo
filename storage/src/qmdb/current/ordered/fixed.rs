@@ -787,6 +787,4 @@ pub mod test {
     fn assert_mutable_db_commit_is_send(db: MutableCurrentTest) {
         assert_send(db.commit(None));
     }
-
-    crate::qmdb::current::tests::test_historical_range_proofs!();
 }

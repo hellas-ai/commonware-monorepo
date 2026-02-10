@@ -63,7 +63,7 @@ pub trait State<D: Digest>: private::Sealed + Sized + Send + Sync {
     /// The merkleization type state for the inner `any::db::Db`.
     type MmrState: mmr::mem::State<D>;
 
-    /// The bitmap type for this state.
+    /// The activity status bitmap type for this state.
     type Bitmap<const N: usize>: Send + Sync;
 }
 
@@ -107,7 +107,7 @@ pub struct Db<
     /// specific value.
     pub(super) any: any::db::Db<E, C, I, H, U, S::MmrState, D>,
 
-    /// The raw bitmap over the activity status of each operation.
+    /// The activity bitmap tracking which operations are currently active.
     pub(super) status: S::Bitmap<N>,
 
     /// Cache of grafted digests keyed by ops MMR positions. At the grafting height, entries are
@@ -243,8 +243,9 @@ where
     /// size, along with the operations and their bitmap chunks.
     ///
     /// The `historical_size` must correspond to a merkleization point (i.e., a bitmap commit
-    /// number). The bitmap state at that point is reconstructed to build the grafted tree and
-    /// generate a proof that verifies against the grafted root at that historical size.
+    /// number). The bitmap state at that point is reconstructed by applying stored reverse
+    /// diffs to build the grafted tree and generate a proof verifiable against the grafted
+    /// root at that historical size.
     ///
     /// Historical bitmap diffs are held in memory only, so this method can only reconstruct
     /// states committed since the current process started. After a restart, prior historical
@@ -261,33 +262,22 @@ where
         start_loc: Location,
         max_ops: NonZeroU64,
     ) -> Result<(RangeProof<H::Digest>, Vec<Operation<K, V, U>>, Vec<[u8; N]>), Error> {
-        // Reconstruct the historical bitmap.
+        // Reconstruct the bitmap as it was at `historical_size`.
         let historical_bitmap = self
             .status
             .get_at_commit(*historical_size)
             .ok_or(Error::NoBitmapCommit(historical_size))?;
 
-        // Extract pinned nodes for the pruned portion from the current grafted digests.
-        // Grafted leaf digests for completed chunks are immutable, so the current grafted
-        // digests cache contains valid peaks for any historical pruning boundary.
-        let pruned_chunks = historical_bitmap.pruned_chunks();
-        let mut pinned_nodes = Vec::new();
-        if pruned_chunks > 0 {
-            let pruned_ops_leaves = pruned_chunks as u64 * BitMap::<N>::CHUNK_SIZE_BITS;
-            let ops_mmr_size = Position::try_from(Location::new_unchecked(pruned_ops_leaves))?;
-            for (ops_pos, _) in PeakIterator::new(ops_mmr_size) {
-                let digest = self
-                    .grafted_digests
-                    .get(&ops_pos)
-                    .ok_or(mmr::Error::MissingNode(ops_pos))?;
-                pinned_nodes.push(*digest);
-            }
-        }
+        // Collect pinned nodes (peaks of the pruned subtree in the grafted MMR).
+        //
+        // Grafted leaf digests for completed chunks are immutable (the chunk content
+        // and ops subtree root never change), so the *current* grafted_digests cache
+        // is valid for any historical pruning boundary.
+        let pinned_nodes = self.collect_pinned_nodes(&historical_bitmap)?;
 
-        // Build the full grafted tree for the historical state.
-        let mut std_hasher = StandardHasher::<H>::new();
+        // Rebuild the grafted MMR using the historical bitmap.
         let (grafted_digests, _) = build_grafted_digests::<H, N>(
-            &mut std_hasher,
+            &mut StandardHasher::<H>::new(),
             &historical_bitmap,
             &pinned_nodes,
             &self.any.log.mmr,
@@ -295,21 +285,21 @@ where
         )
         .await?;
 
-        // Create a grafted storage from the historical digests.
+        // Generate the range proof over the historical grafted MMR.
         let storage =
             grafting::Storage::new(&grafted_digests, &self.any.log.mmr, grafting::height::<N>());
-
-        // Generate the range proof at the historical leaf count.
         let leaves = Location::new_unchecked(historical_bitmap.len());
         if start_loc >= leaves {
             return Err(crate::mmr::Error::RangeOutOfBounds(start_loc).into());
         }
-        let max_loc = start_loc.saturating_add(max_ops.get());
-        let end_loc = core::cmp::min(max_loc, leaves);
+        let end_loc = core::cmp::min(start_loc.saturating_add(max_ops.get()), leaves);
         let proof =
             mmr::verification::historical_range_proof(&storage, leaves, start_loc..end_loc).await?;
 
-        // Handle partial chunk.
+        // Compute the partial chunk digest if the last chunk is incomplete.
+        //
+        // Incomplete chunks are not yet grafted into the MMR, so their digest must
+        // be included in the proof for the verifier to reconstruct the root.
         let (last_chunk, next_bit) = historical_bitmap.last_chunk();
         let partial_chunk_digest = if next_bit != BitMap::<N>::CHUNK_SIZE_BITS {
             hasher.update(last_chunk);
@@ -323,27 +313,54 @@ where
             partial_chunk_digest,
         };
 
-        // Collect operations.
+        // Read the operations in the range.
         let futures = (*start_loc..*end_loc)
             .map(|i| self.any.log.read(Location::new_unchecked(i)))
             .collect::<Vec<_>>();
         let ops: Vec<_> = try_join_all(futures).await?;
 
-        // Gather bitmap chunks covering the range.
+        // Gather bitmap chunks covering the range. The verifier needs these
+        // to reconstruct grafted leaf digests (hash(chunk || ops_subtree_root)).
+        let chunks = self.collect_bitmap_chunks(&historical_bitmap, start_loc, end_loc)?;
+
+        Ok((range_proof, ops, chunks))
+    }
+
+    /// Returns the pinned nodes (grafted MMR peaks) for the pruned portion of a bitmap.
+    fn collect_pinned_nodes(&self, bitmap: &BitMap<N>) -> Result<Vec<H::Digest>, Error> {
+        let pruned_chunks = bitmap.pruned_chunks();
+        if pruned_chunks == 0 {
+            return Ok(Vec::new());
+        }
+        let pruned_ops_leaves = pruned_chunks as u64 * BitMap::<N>::CHUNK_SIZE_BITS;
+        let ops_mmr_size = Position::try_from(Location::new_unchecked(pruned_ops_leaves))?;
+        PeakIterator::new(ops_mmr_size)
+            .map(|(ops_pos, _)| {
+                self.grafted_digests
+                    .get(&ops_pos)
+                    .copied()
+                    .ok_or(mmr::Error::MissingNode(ops_pos).into())
+            })
+            .collect()
+    }
+
+    /// Returns the bitmap chunks covering operations in `[start_loc, end_loc)`.
+    fn collect_bitmap_chunks(
+        &self,
+        bitmap: &BitMap<N>,
+        start_loc: Location,
+        end_loc: Location,
+    ) -> Result<Vec<[u8; N]>, Error> {
         let chunk_bits = BitMap::<N>::CHUNK_SIZE_BITS;
         let start_chunk = *start_loc / chunk_bits;
         let end_chunk = (*end_loc - 1) / chunk_bits;
-        let pruned = historical_bitmap.pruned_chunks() as u64;
+        let pruned = bitmap.pruned_chunks() as u64;
         if start_chunk < pruned {
             return Err(Error::OperationPruned(start_loc));
         }
-        let mut chunks = Vec::with_capacity((end_chunk - start_chunk + 1) as usize);
-        for i in start_chunk..=end_chunk {
-            let relative = (i - pruned) as usize;
-            chunks.push(*historical_bitmap.get_chunk(relative));
-        }
-
-        Ok((range_proof, ops, chunks))
+        Ok((start_chunk..=end_chunk)
+            .map(|i| *bitmap.get_chunk((i - pruned) as usize))
+            .collect())
     }
 }
 
@@ -493,7 +510,7 @@ where
             state,
         } = self;
 
-        // Merkleize the any db (ops MMR: Dirty -> Clean)
+        // Merkleize the any db MMR (ops MMR: Dirty -> Clean).
         let mut any = any.into_merkleized();
 
         // Number of grafted leaves (i.e. complete chunks) at last merkleization.
@@ -523,18 +540,22 @@ where
         )
         .await?;
 
-        // Prune the bitmap of no-longer-necessary bits (staged in dirty layer).
+        // Prune the bitmap of no-longer-necessary bits.
         status.prune_to_bit(*any.inactivity_floor_loc);
 
-        // Commit or abort the historical bitmap. Commit when new operations exist (leaf_count
-        // advanced), abort when no new operations (e.g. immediate re-merkleize).
+        // Commiting the bitmap stores a reverse diff so we can reconstruct this bitmap state later
+        // (for historical proofs). The commit number is the current leaf count, which
+        // corresponds to the MMR size at this merkleization point.
+        //
+        // If the leaf count hasn't advanced (i.e. `into_merkleized` called without new
+        // writes), abort discards the dirty layer without recording a commit.
         let leaf_count = *any.log.bounds().end;
         let status = match status.latest_commit() {
             Some(last) if leaf_count <= last => status.abort(),
             _ => status.commit(leaf_count)?,
         };
 
-        // Compute and cache the root.
+        // Compute and cache the grafted root.
         let storage =
             grafting::Storage::new(&grafted_digests, &any.log.mmr, grafting::height::<N>());
         let root = compute_root::<H, N>(&mut any.log.hasher, status.current(), &storage).await?;
@@ -844,7 +865,6 @@ pub(super) async fn compute_root<H: Hasher, const N: usize>(
 }
 
 /// Update the grafted digest cache to reflect changes in the given bitmap chunks.
-///
 /// Each chunk's grafted leaf is recomputed as `hash(chunk || ops_subtree_root)`, and ancestor
 /// nodes are propagated upward so the tree stays consistent.
 ///

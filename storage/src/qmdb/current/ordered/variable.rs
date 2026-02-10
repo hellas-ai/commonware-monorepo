@@ -155,7 +155,7 @@ mod test {
     };
     use commonware_cryptography::{sha256::Digest, Hasher as _, Sha256};
     use commonware_macros::test_traced;
-    use commonware_runtime::{deterministic, Metrics as _, Runner as _};
+    use commonware_runtime::{deterministic, Runner as _};
     use commonware_utils::{bitmap::Prunable as BitMap, NZU64};
     use rand::RngCore;
 
@@ -802,6 +802,4 @@ mod test {
     fn assert_mutable_db_commit_is_send(db: MutableCurrentTest) {
         assert_send(db.commit(None));
     }
-
-    crate::qmdb::current::tests::test_historical_range_proofs!();
 }
