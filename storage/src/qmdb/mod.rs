@@ -113,9 +113,13 @@ pub enum Error {
     #[error("prune location {0} beyond minimum required location {1}")]
     PruneBeyondMinRequired(Location, Location),
 
-    /// An error from the historical bitmap (e.g., invalid commit number).
+    /// No bitmap commit exists for the requested historical size.
+    #[error("no bitmap commit at {0}")]
+    NoBitmapCommit(Location),
+
+    /// An error from the historical bitmap.
     #[error("bitmap error: {0}")]
-    Bitmap(String),
+    Bitmap(#[from] commonware_utils::bitmap::historical::Error),
 }
 
 impl From<crate::journal::authenticated::Error> for Error {

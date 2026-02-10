@@ -246,9 +246,13 @@ where
     /// number). The bitmap state at that point is reconstructed to build the grafted tree and
     /// generate a proof that verifies against the grafted root at that historical size.
     ///
+    /// Historical bitmap diffs are held in memory only, so this method can only reconstruct
+    /// states committed since the current process started. After a restart, prior historical
+    /// sizes will return [Error::NoBitmapCommit].
+    ///
     /// # Errors
     ///
-    /// - Returns [Error::Bitmap] if `historical_size` does not correspond to a bitmap commit.
+    /// - Returns [Error::NoBitmapCommit] if `historical_size` does not correspond to a bitmap commit.
     /// - Returns [mmr::Error::RangeOutOfBounds] if `start_loc` >= `historical_size`.
     pub async fn historical_range_proof(
         &self,
@@ -261,7 +265,7 @@ where
         let historical_bitmap = self
             .status
             .get_at_commit(*historical_size)
-            .ok_or_else(|| Error::Bitmap(format!("no bitmap commit at {}", *historical_size)))?;
+            .ok_or(Error::NoBitmapCommit(historical_size))?;
 
         // Extract pinned nodes for the pruned portion from the current grafted digests.
         // Grafted leaf digests for completed chunks are immutable, so the current grafted
@@ -527,9 +531,7 @@ where
         let leaf_count = *any.log.bounds().end;
         let status = match status.latest_commit() {
             Some(last) if leaf_count <= last => status.abort(),
-            _ => status
-                .commit(leaf_count)
-                .map_err(|e| Error::Bitmap(e.to_string()))?,
+            _ => status.commit(leaf_count)?,
         };
 
         // Compute and cache the root.
@@ -859,7 +861,8 @@ async fn recompute_grafted_leaves<H: Hasher, const N: usize>(
 
     // Pre-collect inputs: (ops_pos, chunk_bytes, ops_subtree_root).
     // Fetch all ops MMR nodes concurrently.
-    let mut futures = Vec::new();
+    let chunks = chunks.into_iter();
+    let mut futures = Vec::with_capacity(chunks.size_hint().0);
     for (chunk_idx, chunk) in chunks {
         let ops_pos = grafting::chunk_idx_to_ops_pos(chunk_idx as u64, grafting_height);
         futures.push(async move {

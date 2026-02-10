@@ -19,65 +19,6 @@ pub use prunable::Prunable;
 
 pub mod historical;
 
-/// Trait abstracting basic mutable bitmap operations.
-///
-/// This allows code to operate generically over both [Prunable] and
-/// [historical::DirtyBitMap].
-pub trait BitmapOps<const N: usize> {
-    /// Get the value of a bit.
-    fn get_bit(&self, bit: u64) -> bool;
-
-    /// Set the value of a bit.
-    fn set_bit(&mut self, bit: u64, value: bool);
-
-    /// Append a bit to the end.
-    fn push(&mut self, bit: bool);
-
-    /// Return the total number of bits.
-    fn len(&self) -> u64;
-
-    /// Return true if there are no bits.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl<const N: usize> BitmapOps<N> for Prunable<N> {
-    fn get_bit(&self, bit: u64) -> bool {
-        self.get_bit(bit)
-    }
-
-    fn set_bit(&mut self, bit: u64, value: bool) {
-        self.set_bit(bit, value);
-    }
-
-    fn push(&mut self, bit: bool) {
-        self.push(bit);
-    }
-
-    fn len(&self) -> u64 {
-        self.len()
-    }
-}
-
-impl<const N: usize> BitmapOps<N> for historical::DirtyBitMap<N> {
-    fn get_bit(&self, bit: u64) -> bool {
-        self.get_bit(bit)
-    }
-
-    fn set_bit(&mut self, bit: u64, value: bool) {
-        self.set_bit(bit, value);
-    }
-
-    fn push(&mut self, bit: bool) {
-        self.push(bit);
-    }
-
-    fn len(&self) -> u64 {
-        self.len()
-    }
-}
-
 /// The default [BitMap] chunk size in bytes.
 pub const DEFAULT_CHUNK_SIZE: usize = 8;
 
