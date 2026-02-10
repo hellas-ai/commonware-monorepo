@@ -32,6 +32,7 @@ use crate::{
 };
 use commonware_codec::{Codec, CodecShared, DecodeExt};
 use commonware_cryptography::{Digest, DigestOf, Hasher};
+use commonware_parallel::ThreadPool;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_utils::{
     bitmap::{
@@ -43,6 +44,7 @@ use commonware_utils::{
 };
 use core::{num::NonZeroU64, ops::Range};
 use futures::future::try_join_all;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use tracing::{error, warn};
 
@@ -119,6 +121,9 @@ pub struct Db<
 
     /// Metadata storage for persisting pruned_chunks count and grafted digest pinned nodes.
     pub(super) bitmap_metadata: Metadata<E, U64, Vec<u8>>,
+
+    /// Optional thread pool for parallelizing grafted digest computation.
+    pub(super) pool: Option<ThreadPool>,
 
     /// Type state based on whether the database is [Merkleized] or [Unmerkleized].
     pub(super) state: S,
@@ -282,6 +287,7 @@ where
             &historical_bitmap,
             &pinned_nodes,
             &self.any.log.mmr,
+            self.pool.as_ref(),
         )
         .await?;
 
@@ -448,6 +454,7 @@ where
             grafted_digests: self.grafted_digests,
             grafted_leaf_count: self.grafted_leaf_count,
             bitmap_metadata: self.bitmap_metadata,
+            pool: self.pool,
             state: Unmerkleized {
                 dirty_chunks: HashSet::new(),
             },
@@ -478,6 +485,7 @@ where
             mut grafted_digests,
             grafted_leaf_count,
             bitmap_metadata,
+            pool,
             state,
         } = self;
 
@@ -507,6 +515,7 @@ where
             &mut grafted_digests,
             &any.log.mmr,
             chunks_to_update,
+            pool.as_ref(),
         )
         .await?;
 
@@ -534,6 +543,7 @@ where
             grafted_digests,
             grafted_leaf_count: new_grafted_leaves,
             bitmap_metadata,
+            pool,
             state: Merkleized { root },
         })
     }
@@ -559,6 +569,7 @@ where
             grafted_digests: self.grafted_digests,
             grafted_leaf_count: self.grafted_leaf_count,
             bitmap_metadata: self.bitmap_metadata,
+            pool: self.pool,
             state: Unmerkleized {
                 dirty_chunks: self.state.dirty_chunks,
             },
@@ -598,7 +609,7 @@ where
         let dirty_chunks = &mut self.state.dirty_chunks;
         let inactivity_floor_loc = self
             .any
-            .raise_floor_with_callback(&mut self.status, &mut |old_loc, new_loc| {
+            .raise_floor_with_bitmap(&mut self.status, &mut |old_loc, new_loc| {
                 dirty_chunks.insert(BitMap::<N>::unpruned_chunk(*old_loc));
                 dirty_chunks.insert(BitMap::<N>::unpruned_chunk(*new_loc));
             })
@@ -640,6 +651,7 @@ where
                 grafted_digests: self.grafted_digests,
                 grafted_leaf_count: self.grafted_leaf_count,
                 bitmap_metadata: self.bitmap_metadata,
+                pool: self.pool,
                 state: Unmerkleized {
                     dirty_chunks: self.state.dirty_chunks,
                 },
@@ -669,6 +681,7 @@ where
             grafted_digests: self.grafted_digests,
             grafted_leaf_count: self.grafted_leaf_count,
             bitmap_metadata: self.bitmap_metadata,
+            pool: self.pool,
             state: Unmerkleized {
                 dirty_chunks: HashSet::new(),
             },
@@ -828,47 +841,79 @@ pub(super) async fn compute_root<H: Hasher, const N: usize>(
     ))
 }
 
-/// Compute the grafted leaf digest for a given chunk index.
-///
-/// grafted_leaf = hash(chunk || ops_subtree_root)
-async fn compute_grafted_leaf<H: Hasher, const N: usize>(
-    hasher: &mut StandardHasher<H>,
-    chunk: &[u8; N],
-    ops_mmr: &impl mmr::storage::Storage<H::Digest>,
-    chunk_idx: usize,
-) -> Result<H::Digest, Error> {
-    let ops_pos = grafting::chunk_idx_to_ops_pos(chunk_idx as u64, grafting::height::<N>());
-    let ops_digest = ops_mmr
-        .get_node(ops_pos)
-        .await?
-        .ok_or(mmr::Error::MissingGraftedDigest(Location::new_unchecked(
-            chunk_idx as u64,
-        )))?;
-
-    hasher.inner().update(chunk);
-    hasher.inner().update(&ops_digest);
-    Ok(hasher.inner().finalize())
-}
-
 /// Update the grafted digest cache to reflect changes in the given bitmap chunks.
 ///
 /// Each chunk's grafted leaf is recomputed as `hash(chunk || ops_subtree_root)`, and ancestor
 /// nodes are propagated upward so the tree stays consistent.
+///
+/// When a thread pool is provided and there are enough chunks, leaf digests are computed in
+/// parallel using rayon. This follows the same pattern as [`crate::mmr::mem::Mmr::merkleize`].
 async fn recompute_grafted_leaves<H: Hasher, const N: usize>(
     hasher: &mut StandardHasher<H>,
     grafted_digests: &mut BTreeMap<Position, H::Digest>,
     ops_mmr: &impl mmr::storage::Storage<H::Digest>,
     chunks: impl IntoIterator<Item = (usize, [u8; N])>,
+    pool: Option<&ThreadPool>,
 ) -> Result<(), Error> {
     let grafting_height = grafting::height::<N>();
-    let mut dirty_positions = Vec::new();
-    for (chunk_idx, chunk_data) in chunks {
+
+    // Pre-collect inputs: (ops_pos, chunk_bytes, ops_subtree_root).
+    // Fetch all ops MMR nodes concurrently.
+    let mut futures = Vec::new();
+    for (chunk_idx, chunk) in chunks {
         let ops_pos = grafting::chunk_idx_to_ops_pos(chunk_idx as u64, grafting_height);
-        let leaf = compute_grafted_leaf(hasher, &chunk_data, ops_mmr, chunk_idx).await?;
+        futures.push(async move {
+            let ops_digest =
+                ops_mmr
+                    .get_node(ops_pos)
+                    .await?
+                    .ok_or(mmr::Error::MissingGraftedDigest(Location::new_unchecked(
+                        chunk_idx as u64,
+                    )))?;
+            Ok::<_, Error>((ops_pos, chunk, ops_digest))
+        });
+    }
+    let inputs = try_join_all(futures).await?;
+
+    // Compute grafted leaves: hash(chunk || ops_subtree_root) for each input.
+    let leaves: Vec<_> = match pool.filter(|_| inputs.len() >= grafting::MIN_TO_PARALLELIZE) {
+        Some(pool) => pool.install(|| {
+            inputs
+                .into_par_iter()
+                .map_init(
+                    || hasher.fork(),
+                    |h, (ops_pos, chunk, ops_digest)| {
+                        h.inner().update(&chunk);
+                        h.inner().update(&ops_digest);
+                        (ops_pos, h.inner().finalize())
+                    },
+                )
+                .collect()
+        }),
+        None => inputs
+            .into_iter()
+            .map(|(ops_pos, chunk, ops_digest)| {
+                hasher.inner().update(&chunk);
+                hasher.inner().update(&ops_digest);
+                (ops_pos, hasher.inner().finalize())
+            })
+            .collect(),
+    };
+
+    // Insert results and collect dirty positions.
+    let mut dirty_positions = Vec::with_capacity(leaves.len());
+    for (ops_pos, leaf) in leaves {
         grafted_digests.insert(ops_pos, leaf);
         dirty_positions.push(ops_pos);
     }
-    grafting::propagate_dirty(grafted_digests, hasher, &dirty_positions, ops_mmr.size());
+
+    grafting::propagate_dirty(
+        grafted_digests,
+        hasher,
+        &dirty_positions,
+        ops_mmr.size(),
+        pool,
+    );
     Ok(())
 }
 
@@ -881,6 +926,7 @@ pub(super) async fn build_grafted_digests<H: Hasher, const N: usize>(
     bitmap: &BitMap<N>,
     pinned_nodes: &[H::Digest],
     ops_mmr: &impl mmr::storage::Storage<H::Digest>,
+    pool: Option<&ThreadPool>,
 ) -> Result<(BTreeMap<Position, H::Digest>, usize), Error> {
     let pruned_chunks = bitmap.pruned_chunks();
     let mut map = BTreeMap::new();
@@ -902,7 +948,7 @@ pub(super) async fn build_grafted_digests<H: Hasher, const N: usize>(
         let relative_idx = idx - bitmap.pruned_chunks();
         (idx, *bitmap.get_chunk(relative_idx))
     });
-    recompute_grafted_leaves::<H, N>(hasher, &mut map, ops_mmr, chunks).await?;
+    recompute_grafted_leaves::<H, N>(hasher, &mut map, ops_mmr, chunks, pool).await?;
 
     Ok((map, complete_chunks))
 }

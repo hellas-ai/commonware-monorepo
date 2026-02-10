@@ -57,7 +57,7 @@ use crate::{
     qmdb::{operation::Operation, store::State as DurabilityState},
 };
 use commonware_cryptography::DigestOf;
-use commonware_utils::{bitmap::BitmapOps, NZUsize};
+use commonware_utils::NZUsize;
 use core::num::NonZeroUsize;
 use futures::{pin_mut, StreamExt as _};
 use thiserror::Error;
@@ -350,8 +350,6 @@ where
     ///
     /// Expects there is at least one active operation above the inactivity floor, and panics
     /// otherwise.
-    // TODO(https://github.com/commonwarexyz/monorepo/issues/1829): callers of this method should
-    // migrate to using [Self::raise_floor_with_callback] instead.
     async fn raise_floor(&mut self, mut inactivity_floor_loc: Location) -> Result<Location, Error>
     where
         I: Index<Value = Location>,
@@ -369,40 +367,5 @@ where
                 return Ok(inactivity_floor_loc);
             }
         }
-    }
-
-    /// Same as `raise_floor` but uses the status bitmap to more efficiently find the first active
-    /// operation above the inactivity floor. Calls `on_move(old_loc, new_loc)` for each moved
-    /// operation so the caller can update its own bookkeeping.
-    ///
-    /// # Panics
-    ///
-    /// Panics if there is not at least one active operation above the inactivity floor.
-    pub(crate) async fn raise_floor_with_callback<const N: usize>(
-        &mut self,
-        status: &mut impl BitmapOps<N>,
-        mut inactivity_floor_loc: Location,
-        on_move: &mut impl FnMut(Location, Location),
-    ) -> Result<Location, Error>
-    where
-        I: Index<Value = Location>,
-    {
-        // Use the status bitmap to find the first active operation above the inactivity floor.
-        while !status.get_bit(*inactivity_floor_loc) {
-            inactivity_floor_loc += 1;
-        }
-
-        // Move the active operation to tip.
-        let op = self.log.read(*inactivity_floor_loc).await?;
-        assert!(
-            self.move_op_if_active(op, inactivity_floor_loc).await?,
-            "op should be active based on status bitmap"
-        );
-        status.set_bit(*inactivity_floor_loc, false);
-        let new_loc = Location::new_unchecked(status.len());
-        status.push(true);
-        on_move(inactivity_floor_loc, new_loc);
-
-        Ok(inactivity_floor_loc + 1)
     }
 }
