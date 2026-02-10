@@ -57,7 +57,7 @@ use crate::{
     qmdb::{operation::Operation, store::State as DurabilityState},
 };
 use commonware_cryptography::DigestOf;
-use commonware_utils::{bitmap::Prunable as BitMap, NZUsize};
+use commonware_utils::{bitmap::BitmapOps, NZUsize};
 use core::num::NonZeroUsize;
 use futures::{pin_mut, StreamExt as _};
 use thiserror::Error;
@@ -112,6 +112,10 @@ pub enum Error {
 
     #[error("prune location {0} beyond minimum required location {1}")]
     PruneBeyondMinRequired(Location, Location),
+
+    /// An error from the historical bitmap (e.g., invalid commit number).
+    #[error("bitmap error: {0}")]
+    Bitmap(String),
 }
 
 impl From<crate::journal::authenticated::Error> for Error {
@@ -376,7 +380,7 @@ where
     /// Panics if there is not at least one active operation above the inactivity floor.
     pub(crate) async fn raise_floor_with_callback<const N: usize>(
         &mut self,
-        status: &mut BitMap<N>,
+        status: &mut impl BitmapOps<N>,
         mut inactivity_floor_loc: Location,
         on_move: &mut impl FnMut(Location, Location),
     ) -> Result<Location, Error>

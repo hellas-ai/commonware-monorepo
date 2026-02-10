@@ -220,11 +220,11 @@ impl<
     > BitmapPrunedBits for fixed::Db<E, K, V, H, T, N, Merkleized<DigestOf<H>>, Durable>
 {
     fn pruned_bits(&self) -> u64 {
-        self.status.pruned_bits()
+        self.status.current().pruned_bits()
     }
 
     fn get_bit(&self, index: u64) -> bool {
-        self.status.get_bit(index)
+        self.status.current().get_bit(index)
     }
 
     fn oldest_retained(&self) -> u64 {
@@ -244,11 +244,11 @@ where
     VariableOperation<K, V>: Read,
 {
     fn pruned_bits(&self) -> u64 {
-        self.status.pruned_bits()
+        self.status.current().pruned_bits()
     }
 
     fn get_bit(&self, index: u64) -> bool {
-        self.status.get_bit(index)
+        self.status.current().get_bit(index)
     }
 
     fn oldest_retained(&self) -> u64 {
@@ -361,11 +361,11 @@ impl<
     for fixed::partitioned::Db<E, K, V, H, T, P, N, Merkleized<DigestOf<H>>, Durable>
 {
     fn pruned_bits(&self) -> u64 {
-        self.status.pruned_bits()
+        self.status.current().pruned_bits()
     }
 
     fn get_bit(&self, index: u64) -> bool {
-        self.status.get_bit(index)
+        self.status.current().get_bit(index)
     }
 
     fn oldest_retained(&self) -> u64 {
@@ -489,11 +489,11 @@ where
     VariableOperation<K, V>: Read,
 {
     fn pruned_bits(&self) -> u64 {
-        self.status.pruned_bits()
+        self.status.current().pruned_bits()
     }
 
     fn get_bit(&self, index: u64) -> bool {
-        self.status.get_bit(index)
+        self.status.current().get_bit(index)
     }
 
     fn oldest_retained(&self) -> u64 {

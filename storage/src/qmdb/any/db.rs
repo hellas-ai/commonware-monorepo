@@ -24,7 +24,7 @@ use crate::{
 use commonware_codec::{Codec, CodecShared};
 use commonware_cryptography::{DigestOf, Hasher};
 use commonware_runtime::{Clock, Metrics, Storage};
-use commonware_utils::{bitmap::Prunable as BitMap, Array};
+use commonware_utils::{bitmap::BitmapOps, Array};
 use core::{num::NonZeroU64, ops::Range};
 use tracing::debug;
 
@@ -410,7 +410,7 @@ where
     /// operation so the caller can update its own bookkeeping.
     pub(crate) async fn raise_floor_with_callback<const N: usize>(
         &mut self,
-        status: &mut BitMap<N>,
+        status: &mut impl BitmapOps<N>,
         on_move: &mut impl FnMut(Location, Location),
     ) -> Result<Location, Error> {
         if self.is_empty() {

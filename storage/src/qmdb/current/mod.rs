@@ -149,7 +149,10 @@ use commonware_codec::{Codec, CodecFixedShared, FixedSize, Read};
 use commonware_cryptography::{DigestOf, Hasher};
 use commonware_parallel::ThreadPool;
 use commonware_runtime::{buffer::paged::CacheRef, Clock, Metrics, Storage};
-use commonware_utils::{bitmap::Prunable as BitMap, Array};
+use commonware_utils::{
+    bitmap::{historical::CleanBitMap, Prunable as BitMap},
+    Array,
+};
 use std::num::{NonZeroU64, NonZeroUsize};
 
 pub mod db;
@@ -346,6 +349,8 @@ where
     let storage = grafting::Storage::new(&grafted_digests, &any.log.mmr, grafting::height::<N>());
     let root = db::compute_root::<H, N>(&mut hasher, &status, &storage).await?;
 
+    let status = CleanBitMap::from_prunable(status);
+
     Ok(db::Db {
         any,
         status,
@@ -429,6 +434,8 @@ where
     // Compute and cache the root.
     let storage = grafting::Storage::new(&grafted_digests, &any.log.mmr, grafting::height::<N>());
     let root = db::compute_root::<H, N>(&mut hasher, &status, &storage).await?;
+
+    let status = CleanBitMap::from_prunable(status);
 
     Ok(db::Db {
         any,

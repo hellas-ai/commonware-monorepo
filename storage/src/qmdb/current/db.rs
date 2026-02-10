@@ -33,8 +33,16 @@ use crate::{
 use commonware_codec::{Codec, CodecShared, DecodeExt};
 use commonware_cryptography::{Digest, DigestOf, Hasher};
 use commonware_runtime::{Clock, Metrics, Storage};
-use commonware_utils::{bitmap::Prunable as BitMap, sequence::prefixed_u64::U64, Array};
+use commonware_utils::{
+    bitmap::{
+        historical::{CleanBitMap, DirtyBitMap},
+        Prunable as BitMap,
+    },
+    sequence::prefixed_u64::U64,
+    Array,
+};
 use core::{num::NonZeroU64, ops::Range};
+use futures::future::try_join_all;
 use std::collections::{BTreeMap, HashSet};
 use tracing::{error, warn};
 
@@ -52,6 +60,9 @@ mod private {
 pub trait State<D: Digest>: private::Sealed + Sized + Send + Sync {
     /// The merkleization type state for the inner `any::db::Db`.
     type MmrState: mmr::mem::State<D>;
+
+    /// The bitmap type for this state.
+    type Bitmap<const N: usize>: Send + Sync;
 }
 
 /// Merkleized state: the database has been merkleized and the root is cached.
@@ -63,6 +74,7 @@ pub struct Merkleized<D: Digest> {
 impl<D: Digest> private::Sealed for Merkleized<D> {}
 impl<D: Digest> State<D> for Merkleized<D> {
     type MmrState = mmr::mem::Clean<D>;
+    type Bitmap<const N: usize> = CleanBitMap<N>;
 }
 
 /// Unmerkleized state: the database has pending changes not yet merkleized.
@@ -75,6 +87,7 @@ pub struct Unmerkleized {
 impl private::Sealed for Unmerkleized {}
 impl<D: Digest> State<D> for Unmerkleized {
     type MmrState = mmr::mem::Dirty;
+    type Bitmap<const N: usize> = DirtyBitMap<N>;
 }
 
 /// A Current QMDB implementation generic over ordered/unordered keys and variable/fixed values.
@@ -93,7 +106,7 @@ pub struct Db<
     pub(super) any: any::db::Db<E, C, I, H, U, S::MmrState, D>,
 
     /// The raw bitmap over the activity status of each operation.
-    pub(super) status: BitMap<N>,
+    pub(super) status: S::Bitmap<N>,
 
     /// Cache of grafted digests keyed by ops MMR positions. At the grafting height, entries are
     /// `hash(chunk || ops_subtree_root)`. Above the grafting height, entries are standard MMR
@@ -191,7 +204,7 @@ where
         loc: Location,
     ) -> Result<OperationProof<H::Digest, N>, Error> {
         let storage = self.grafted_storage();
-        OperationProof::new(hasher, &self.status, &storage, loc).await
+        OperationProof::new(hasher, self.status.current(), &storage, loc).await
     }
 
     /// Returns a proof that the specified range of operations are part of the database, along with
@@ -212,13 +225,115 @@ where
         let storage = self.grafted_storage();
         RangeProof::new_with_ops(
             hasher,
-            &self.status,
+            self.status.current(),
             &storage,
             &self.any.log,
             start_loc,
             max_ops,
         )
         .await
+    }
+
+    /// Returns a historical proof for the specified range of operations at the given historical
+    /// size, along with the operations and their bitmap chunks.
+    ///
+    /// The `historical_size` must correspond to a merkleization point (i.e., a bitmap commit
+    /// number). The bitmap state at that point is reconstructed to build the grafted tree and
+    /// generate a proof that verifies against the grafted root at that historical size.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [Error::Bitmap] if `historical_size` does not correspond to a bitmap commit.
+    /// - Returns [mmr::Error::RangeOutOfBounds] if `start_loc` >= `historical_size`.
+    pub async fn historical_range_proof(
+        &self,
+        hasher: &mut H,
+        historical_size: Location,
+        start_loc: Location,
+        max_ops: NonZeroU64,
+    ) -> Result<(RangeProof<H::Digest>, Vec<Operation<K, V, U>>, Vec<[u8; N]>), Error> {
+        // Reconstruct the historical bitmap.
+        let historical_bitmap = self
+            .status
+            .get_at_commit(*historical_size)
+            .ok_or_else(|| Error::Bitmap(format!("no bitmap commit at {}", *historical_size)))?;
+
+        // Extract pinned nodes for the pruned portion from the current grafted digests.
+        // Grafted leaf digests for completed chunks are immutable, so the current grafted
+        // digests cache contains valid peaks for any historical pruning boundary.
+        let pruned_chunks = historical_bitmap.pruned_chunks();
+        let mut pinned_nodes = Vec::new();
+        if pruned_chunks > 0 {
+            let pruned_ops_leaves = pruned_chunks as u64 * BitMap::<N>::CHUNK_SIZE_BITS;
+            let ops_mmr_size = Position::try_from(Location::new_unchecked(pruned_ops_leaves))?;
+            for (ops_pos, _) in PeakIterator::new(ops_mmr_size) {
+                let digest = self
+                    .grafted_digests
+                    .get(&ops_pos)
+                    .ok_or(mmr::Error::MissingNode(ops_pos))?;
+                pinned_nodes.push(*digest);
+            }
+        }
+
+        // Build the full grafted tree for the historical state.
+        let mut std_hasher = StandardHasher::<H>::new();
+        let (grafted_digests, _) = build_grafted_digests::<H, N>(
+            &mut std_hasher,
+            &historical_bitmap,
+            &pinned_nodes,
+            &self.any.log.mmr,
+        )
+        .await?;
+
+        // Create a grafted storage from the historical digests.
+        let storage =
+            grafting::Storage::new(&grafted_digests, &self.any.log.mmr, grafting::height::<N>());
+
+        // Generate the range proof at the historical leaf count.
+        let leaves = Location::new_unchecked(historical_bitmap.len());
+        if start_loc >= leaves {
+            return Err(crate::mmr::Error::RangeOutOfBounds(start_loc).into());
+        }
+        let max_loc = start_loc.saturating_add(max_ops.get());
+        let end_loc = core::cmp::min(max_loc, leaves);
+        let proof =
+            mmr::verification::historical_range_proof(&storage, leaves, start_loc..end_loc).await?;
+
+        // Handle partial chunk.
+        let (last_chunk, next_bit) = historical_bitmap.last_chunk();
+        let partial_chunk_digest = if next_bit != BitMap::<N>::CHUNK_SIZE_BITS {
+            hasher.update(last_chunk);
+            Some(hasher.finalize())
+        } else {
+            None
+        };
+
+        let range_proof = RangeProof {
+            proof,
+            partial_chunk_digest,
+        };
+
+        // Collect operations.
+        let futures = (*start_loc..*end_loc)
+            .map(|i| self.any.log.read(Location::new_unchecked(i)))
+            .collect::<Vec<_>>();
+        let ops: Vec<_> = try_join_all(futures).await?;
+
+        // Gather bitmap chunks covering the range.
+        let chunk_bits = BitMap::<N>::CHUNK_SIZE_BITS;
+        let start_chunk = *start_loc / chunk_bits;
+        let end_chunk = (*end_loc - 1) / chunk_bits;
+        let pruned = historical_bitmap.pruned_chunks() as u64;
+        if start_chunk < pruned {
+            return Err(Error::OperationPruned(start_loc));
+        }
+        let mut chunks = Vec::with_capacity((end_chunk - start_chunk + 1) as usize);
+        for i in start_chunk..=end_chunk {
+            let relative = (i - pruned) as usize;
+            chunks.push(*historical_bitmap.get_chunk(relative));
+        }
+
+        Ok((range_proof, ops, chunks))
     }
 }
 
@@ -250,7 +365,14 @@ where
         // a pruned log with stale metadata would lose peak digests permanently.
         self.write_pruned().await?;
 
-        self.any.prune(prune_loc).await
+        self.any.prune(prune_loc).await?;
+
+        // Prune historical bitmap commits that are fully before the prune point.
+        // Historical proofs for sizes below prune_loc are impossible because the ops
+        // log has been pruned too.
+        self.status.prune_commits_before(*prune_loc);
+
+        Ok(())
     }
 
     /// Write the information necessary to restore grafted digests after pruning.
@@ -259,12 +381,13 @@ where
 
         // Write the number of pruned chunks.
         let key = U64::new(PRUNED_CHUNKS_PREFIX, 0);
+        let pruned_chunks = self.status.current().pruned_chunks();
         self.bitmap_metadata
-            .put(key, self.status.pruned_chunks().to_be_bytes().to_vec());
+            .put(key, pruned_chunks.to_be_bytes().to_vec());
 
         // Write the grafted digest pinned nodes. These are the ops-space peaks covering the
         // pruned portion of the bitmap.
-        let pruned_ops_leaves = self.status.pruned_chunks() as u64 * BitMap::<N>::CHUNK_SIZE_BITS;
+        let pruned_ops_leaves = pruned_chunks as u64 * BitMap::<N>::CHUNK_SIZE_BITS;
         let ops_mmr_size = Position::try_from(Location::new_unchecked(pruned_ops_leaves))?;
         for (i, (ops_pos, _)) in PeakIterator::new(ops_mmr_size).enumerate() {
             let digest = self
@@ -321,7 +444,7 @@ where
     pub fn into_mutable(self) -> Db<E, C, I, H, U, N, Unmerkleized, NonDurable> {
         Db {
             any: self.any.into_mutable(),
-            status: self.status,
+            status: self.status.into_dirty(),
             grafted_digests: self.grafted_digests,
             grafted_leaf_count: self.grafted_leaf_count,
             bitmap_metadata: self.bitmap_metadata,
@@ -367,29 +490,43 @@ where
         let new_grafted_leaves = status.complete_chunks();
 
         // Need to compute grafted leaves for new complete chunks and modified existing chunks.
-        let chunks_to_update = (old_grafted_leaves..new_grafted_leaves).chain(
-            state
-                .dirty_chunks
-                .iter()
-                .copied()
-                .filter(|&c| c < old_grafted_leaves),
-        );
+        let chunks_to_update = (old_grafted_leaves..new_grafted_leaves)
+            .chain(
+                state
+                    .dirty_chunks
+                    .iter()
+                    .copied()
+                    .filter(|&c| c < old_grafted_leaves),
+            )
+            .map(|idx| {
+                let bit = idx as u64 * BitMap::<N>::CHUNK_SIZE_BITS;
+                (idx, status.get_chunk(bit))
+            });
         recompute_grafted_leaves::<H, N>(
             &mut any.log.hasher,
-            &status,
             &mut grafted_digests,
             &any.log.mmr,
             chunks_to_update,
         )
         .await?;
 
-        // Prune the bitmap of no-longer-necessary bits.
+        // Prune the bitmap of no-longer-necessary bits (staged in dirty layer).
         status.prune_to_bit(*any.inactivity_floor_loc);
+
+        // Commit or abort the historical bitmap. Commit when new operations exist (leaf_count
+        // advanced), abort when no new operations (e.g. immediate re-merkleize).
+        let leaf_count = *any.log.bounds().end;
+        let status = match status.latest_commit() {
+            Some(last) if leaf_count <= last => status.abort(),
+            _ => status
+                .commit(leaf_count)
+                .map_err(|e| Error::Bitmap(e.to_string()))?,
+        };
 
         // Compute and cache the root.
         let storage =
             grafting::Storage::new(&grafted_digests, &any.log.mmr, grafting::height::<N>());
-        let root = compute_root::<H, N>(&mut any.log.hasher, &status, &storage).await?;
+        let root = compute_root::<H, N>(&mut any.log.hasher, status.current(), &storage).await?;
 
         Ok(Db {
             any,
@@ -528,7 +665,7 @@ where
     pub fn into_mutable(self) -> Db<E, C, I, H, U, N, Unmerkleized, NonDurable> {
         Db {
             any: self.any.into_mutable(),
-            status: self.status,
+            status: self.status.into_dirty(),
             grafted_digests: self.grafted_digests,
             grafted_leaf_count: self.grafted_leaf_count,
             bitmap_metadata: self.bitmap_metadata,
@@ -567,10 +704,7 @@ where
     }
 }
 
-// MerkleizedStore for Merkleized states (both Durable and NonDurable)
-// TODO(https://github.com/commonwarexyz/monorepo/issues/2560): This is broken -- it's computing
-// proofs only over the any db mmr not the grafted mmr, so they won't validate against the grafted
-// root.
+// MerkleizedStore for Merkleized states (both Durable and NonDurable).
 impl<E, K, V, U, C, I, H, D, const N: usize> MerkleizedStore
     for Db<E, C, I, H, U, N, Merkleized<DigestOf<H>>, D>
 where
@@ -597,9 +731,11 @@ where
         start_loc: Location,
         max_ops: NonZeroU64,
     ) -> Result<(Proof<Self::Digest>, Vec<Self::Operation>), Error> {
-        self.any
-            .historical_proof(historical_size, start_loc, max_ops)
-            .await
+        let mut hasher = H::new();
+        let (range_proof, ops, _chunks) = self
+            .historical_range_proof(&mut hasher, historical_size, start_loc, max_ops)
+            .await?;
+        Ok((range_proof.proof, ops))
     }
 }
 
@@ -695,15 +831,12 @@ pub(super) async fn compute_root<H: Hasher, const N: usize>(
 /// Compute the grafted leaf digest for a given chunk index.
 ///
 /// grafted_leaf = hash(chunk || ops_subtree_root)
-async fn compute_grafted_leaf_for_chunk<H: Hasher, const N: usize>(
+async fn compute_grafted_leaf<H: Hasher, const N: usize>(
     hasher: &mut StandardHasher<H>,
-    status: &BitMap<N>,
+    chunk: &[u8; N],
     ops_mmr: &impl mmr::storage::Storage<H::Digest>,
     chunk_idx: usize,
 ) -> Result<H::Digest, Error> {
-    let relative_idx = chunk_idx - status.pruned_chunks();
-    let chunk = status.get_chunk(relative_idx);
-
     let ops_pos = grafting::chunk_idx_to_ops_pos(chunk_idx as u64, grafting::height::<N>());
     let ops_digest = ops_mmr
         .get_node(ops_pos)
@@ -723,16 +856,15 @@ async fn compute_grafted_leaf_for_chunk<H: Hasher, const N: usize>(
 /// nodes are propagated upward so the tree stays consistent.
 async fn recompute_grafted_leaves<H: Hasher, const N: usize>(
     hasher: &mut StandardHasher<H>,
-    bitmap: &BitMap<N>,
     grafted_digests: &mut BTreeMap<Position, H::Digest>,
     ops_mmr: &impl mmr::storage::Storage<H::Digest>,
-    chunks: impl Iterator<Item = usize>,
+    chunks: impl IntoIterator<Item = (usize, [u8; N])>,
 ) -> Result<(), Error> {
     let grafting_height = grafting::height::<N>();
     let mut dirty_positions = Vec::new();
-    for chunk_idx in chunks {
+    for (chunk_idx, chunk_data) in chunks {
         let ops_pos = grafting::chunk_idx_to_ops_pos(chunk_idx as u64, grafting_height);
-        let leaf = compute_grafted_leaf_for_chunk(hasher, bitmap, ops_mmr, chunk_idx).await?;
+        let leaf = compute_grafted_leaf(hasher, &chunk_data, ops_mmr, chunk_idx).await?;
         grafted_digests.insert(ops_pos, leaf);
         dirty_positions.push(ops_pos);
     }
@@ -766,14 +898,11 @@ pub(super) async fn build_grafted_digests<H: Hasher, const N: usize>(
     // Compute grafted leaves for each unpruned complete chunk and propagate upward. Pinned
     // nodes (peaks of the pruned subtree) serve as siblings during propagation.
     let complete_chunks = bitmap.complete_chunks();
-    recompute_grafted_leaves::<H, N>(
-        hasher,
-        bitmap,
-        &mut map,
-        ops_mmr,
-        pruned_chunks..complete_chunks,
-    )
-    .await?;
+    let chunks = (pruned_chunks..complete_chunks).map(|idx| {
+        let relative_idx = idx - bitmap.pruned_chunks();
+        (idx, *bitmap.get_chunk(relative_idx))
+    });
+    recompute_grafted_leaves::<H, N>(hasher, &mut map, ops_mmr, chunks).await?;
 
     Ok((map, complete_chunks))
 }

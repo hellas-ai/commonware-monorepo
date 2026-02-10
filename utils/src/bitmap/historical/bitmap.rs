@@ -147,6 +147,15 @@ impl<const N: usize> CleanBitMap<N> {
         })
     }
 
+    /// Create a historical bitmap wrapping an existing [Prunable] with no historical commits.
+    pub const fn from_prunable(prunable: Prunable<N>) -> Self {
+        Self {
+            current: prunable,
+            commits: BTreeMap::new(),
+            state: Clean,
+        }
+    }
+
     /// Transition to dirty state to begin making mutations.
     ///
     /// All mutations are applied to a diff layer and do not affect the current
@@ -452,6 +461,24 @@ impl<const N: usize> DirtyBitMap<N> {
     #[inline]
     pub const fn pruned_chunks(&self) -> usize {
         self.state.projected_pruned_chunks
+    }
+
+    /// Return the number of complete (fully filled) chunks as projected after committing.
+    pub const fn complete_chunks(&self) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+        let total_chunks = self.len().div_ceil(Prunable::<N>::CHUNK_SIZE_BITS) as usize;
+        if self.len() % Prunable::<N>::CHUNK_SIZE_BITS == 0 {
+            total_chunks
+        } else {
+            total_chunks - 1
+        }
+    }
+
+    /// Return the latest (highest) commit number, if any commits exist.
+    pub fn latest_commit(&self) -> Option<u64> {
+        self.commits.keys().next_back().copied()
     }
 
     /// Get a bit value with read-through semantics.
