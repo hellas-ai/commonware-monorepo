@@ -191,7 +191,7 @@ pub mod test {
             let proof = db.key_value_proof(hasher.inner(), k).await.unwrap();
 
             // Proof should be verifiable against current root.
-            let root = db.root();
+            let root = db.root().await;
             assert!(CleanCurrentTest::verify_key_value_proof(
                 hasher.inner(),
                 k,
@@ -215,7 +215,7 @@ pub mod test {
             db.write_batch([(k, Some(v2))]).await.unwrap();
             let (db, _) = db.commit(None).await.unwrap();
             let db = db.into_merkleized().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
 
             // New value should not be verifiable against the old proof.
             assert!(!CleanCurrentTest::verify_key_value_proof(
@@ -331,7 +331,7 @@ pub mod test {
             let partition = "range_proofs".to_string();
             let mut hasher = StandardHasher::<Sha256>::new();
             let db = open_db(context.with_label("db"), partition.clone()).await;
-            let root = db.root();
+            let root = db.root().await;
 
             // Empty range proof should not crash or verify, since even an empty db has a single
             // commit op.
@@ -358,7 +358,7 @@ pub mod test {
             .unwrap();
             let (db, _) = db.commit(None).await.unwrap();
             let db = db.into_merkleized().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
 
             // Make sure size-constrained batches of operations are provable from the oldest
             // retained op to tip.
@@ -414,7 +414,7 @@ pub mod test {
                 .unwrap();
             let (db, _) = db.commit(None).await.unwrap();
             let db = db.into_merkleized().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
 
             // Confirm bad keys produce the expected error.
             let bad_key = Sha256::fill(0xAA);
@@ -501,7 +501,7 @@ pub mod test {
                 assert_eq!(dirty_db.get(&k).await.unwrap().unwrap(), v);
                 let (durable_db, _) = dirty_db.commit(None).await.unwrap();
                 db = durable_db.into_merkleized().await.unwrap();
-                let root = db.root();
+                let root = db.root().await;
 
                 // Create a proof for the current value of k.
                 let proof = db.key_value_proof(hasher.inner(), k).await.unwrap();

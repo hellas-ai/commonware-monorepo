@@ -185,7 +185,7 @@ pub mod test {
             let proof = db.key_value_proof(hasher.inner(), k).await.unwrap();
 
             // Proof should be verifiable against current root.
-            let root = db.root();
+            let root = db.root().await;
             assert!(CleanCurrentTest::verify_key_value_proof(
                 hasher.inner(),
                 k,
@@ -219,7 +219,7 @@ pub mod test {
             db.write_batch([(k, Some(v2))]).await.unwrap();
             let (db, _) = db.commit(None).await.unwrap();
             let db = db.into_merkleized().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
 
             // New value should not be verifiable against the old proof.
             assert!(!CleanCurrentTest::verify_key_value_proof(
@@ -340,7 +340,7 @@ pub mod test {
             let partition = "range_proofs".to_string();
             let mut hasher = StandardHasher::<Sha256>::new();
             let db = open_db(context.with_label("db"), partition).await;
-            let root = db.root();
+            let root = db.root().await;
 
             // Empty range proof should not crash or verify, since even an empty db has a single
             // commit op.
@@ -363,7 +363,7 @@ pub mod test {
                 .unwrap();
             let (db, _) = db.commit(None).await.unwrap();
             let db = db.into_merkleized().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
 
             // Make sure size-constrained batches of operations are provable from the oldest
             // retained op to tip.
@@ -419,7 +419,7 @@ pub mod test {
                 .unwrap();
             let (db, _) = db.commit(None).await.unwrap();
             let db = db.into_merkleized().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
 
             // Confirm bad keys produce the expected error.
             let bad_key = Sha256::fill(0xAA);
@@ -515,7 +515,7 @@ pub mod test {
                 let (dirty_db, _) = dirty_db.commit(None).await.unwrap();
                 let clean_db = dirty_db.into_merkleized().await.unwrap();
                 db = clean_db;
-                let root = db.root();
+                let root = db.root().await;
 
                 // Create a proof for the current value of k.
                 let proof = db.key_value_proof(hasher.inner(), k).await.unwrap();
@@ -553,7 +553,7 @@ pub mod test {
             let key_exists_1 = Sha256::fill(0x10);
 
             // We should be able to prove exclusion for any key against an empty db.
-            let empty_root = db.root();
+            let empty_root = db.root().await;
             let empty_proof = db
                 .exclusion_proof(hasher.inner(), &key_exists_1)
                 .await
@@ -571,7 +571,7 @@ pub mod test {
             db.write_batch([(key_exists_1, Some(v1))]).await.unwrap();
             let (db, _) = db.commit(None).await.unwrap();
             let db = db.into_merkleized().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
 
             // We shouldn't be able to generate an exclusion proof for a key already in the db.
             let result = db.exclusion_proof(hasher.inner(), &key_exists_1).await;
@@ -621,7 +621,7 @@ pub mod test {
             db.write_batch([(key_exists_2, Some(v2))]).await.unwrap();
             let (db, _) = db.commit(None).await.unwrap();
             let db = db.into_merkleized().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
 
             // Use a lesser/greater key that has a translated-key conflict based
             // on our use of OneCap translator.
@@ -716,7 +716,7 @@ pub mod test {
             let (db, _) = db.commit(None).await.unwrap();
             let mut db = db.into_merkleized().await.unwrap();
             db.sync().await.unwrap();
-            let root = db.root();
+            let root = db.root().await;
             // This root should be different than the empty root from earlier since the DB now has a
             // non-zero number of operations.
             assert!(db.is_empty());
