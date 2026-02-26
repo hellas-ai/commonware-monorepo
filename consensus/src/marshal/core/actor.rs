@@ -1003,7 +1003,9 @@ where
                     return false;
                 };
 
-                if notarization.round() != round || V::commitment(&block) != notarization.commitment() {
+                if notarization.round() != round
+                    || V::commitment(&block) != notarization.commitment()
+                {
                     response.send_lossy(false);
                     return false;
                 }

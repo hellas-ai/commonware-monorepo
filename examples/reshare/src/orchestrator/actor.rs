@@ -7,8 +7,8 @@ use crate::{
 };
 use commonware_consensus::{
     elector::Config as Elector,
-    marshal::{core::Mailbox as MarshalMailbox, standard::Standard},
-    simplex::{self, scheme, types::Context, Plan},
+    marshal::{core::Mailbox as MarshalMailbox, standard::StandardSimplex},
+    simplex::{self, scheme::Scheme as SimplexScheme, types::Context, Plan},
     types::{Epoch, Epocher, FixedEpocher, ViewDelta},
     CertifiableAutomaton, Relay,
 };
@@ -39,15 +39,17 @@ where
     C: Signer,
     H: Hasher,
     A: CertifiableAutomaton<Context = Context<H::Digest, C::PublicKey>, Digest = H::Digest>
-        + Relay<Digest = H::Digest, PublicKey = C::PublicKey, Plan = Plan<C::PublicKey>>,
-    S: Scheme,
+
+        + Relay<Digest = H::Digest>,
+    S: Scheme + SimplexScheme<H::Digest>,
+
     L: Elector<S>,
     T: Strategy,
 {
     pub oracle: B,
     pub application: A,
     pub provider: Provider<S, C>,
-    pub marshal: MarshalMailbox<S, Standard<Block<H, C, V>>>,
+    pub marshal: MarshalMailbox<StandardSimplex<Block<H, C, V>, S>>,
     pub strategy: T,
 
     pub muxer_size: usize,
@@ -67,8 +69,10 @@ where
     C: Signer,
     H: Hasher,
     A: CertifiableAutomaton<Context = Context<H::Digest, C::PublicKey>, Digest = H::Digest>
-        + Relay<Digest = H::Digest, PublicKey = C::PublicKey, Plan = Plan<C::PublicKey>>,
-    S: Scheme,
+
+        + Relay<Digest = H::Digest>,
+    S: Scheme + SimplexScheme<H::Digest>,
+
     L: Elector<S>,
     T: Strategy,
     Provider<S, C>: EpochProvider<Variant = V, PublicKey = C::PublicKey, Scheme = S>,
@@ -78,7 +82,7 @@ where
     application: A,
 
     oracle: B,
-    marshal: MarshalMailbox<S, Standard<Block<H, C, V>>>,
+    marshal: MarshalMailbox<StandardSimplex<Block<H, C, V>, S>>,
     provider: Provider<S, C>,
     strategy: T,
 
@@ -99,8 +103,10 @@ where
     C: Signer,
     H: Hasher,
     A: CertifiableAutomaton<Context = Context<H::Digest, C::PublicKey>, Digest = H::Digest>
-        + Relay<Digest = H::Digest, PublicKey = C::PublicKey, Plan = Plan<C::PublicKey>>,
-    S: scheme::Scheme<H::Digest, PublicKey = C::PublicKey>,
+
+        + Relay<Digest = H::Digest>,
+    S: SimplexScheme<H::Digest, PublicKey = C::PublicKey>,
+
     L: Elector<S>,
     T: Strategy,
     Provider<S, C>: EpochProvider<Variant = V, PublicKey = C::PublicKey, Scheme = S>,

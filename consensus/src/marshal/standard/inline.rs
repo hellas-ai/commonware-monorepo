@@ -164,12 +164,7 @@ where
     ///
     /// Registers a `build_duration` histogram for proposal latency and initializes
     /// the shared "last built block" cache used by [`Relay::broadcast`].
-    pub fn new(
-        context: E,
-        application: A,
-        marshal: Mailbox<Standard<B, C>>,
-        epocher: ES,
-    ) -> Self {
+    pub fn new(context: E, application: A, marshal: Mailbox<Standard<B, C>>, epocher: ES) -> Self {
         let build_histogram = Histogram::new(Buckets::LOCAL);
         context.register(
             "build_duration",
@@ -543,19 +538,8 @@ where
 mod tests {
     use super::Inline;
     use crate::{
-<<<<<<< HEAD
-        marshal::mocks::{
-            harness::{
-                default_leader, make_raw_block, setup_network, Ctx, StandardHarness, TestHarness,
-                B, BLOCKS_PER_EPOCH, NAMESPACE, NUM_VALIDATORS, S, V,
-            },
-            verifying::MockVerifyingApp,
-        },
-        marshal::core::SimplexConsensus,
-        simplex,
-        simplex::{scheme::bls12381_threshold::vrf as bls12381_threshold_vrf, types::Context},
-        types::{Epoch, FixedEpocher, Height, Round, View},
-        Automaton, Block, CertifiableAutomaton, Relay, VerifyingApplication,
+        marshal::core::SimplexConsensus, simplex, simplex::types::Context, Automaton, Block,
+        CertifiableAutomaton, Relay, VerifyingApplication,
     };
     use commonware_cryptography::{
         certificate::{mocks::Fixture, ConstantProvider, Scheme},
