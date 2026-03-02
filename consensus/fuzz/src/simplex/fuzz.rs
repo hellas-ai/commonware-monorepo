@@ -1,228 +1,46 @@
-pub mod bounds;
-pub mod minimmit;
-pub mod simplex;
-pub mod utils;
-
-use crate::{simplex::strategy::StrategyChoice, utils::Partition};
-use arbitrary::Arbitrary;
+use super::{
+    disrupter::Disrupter,
+    invariants,
+    strategy::{AnyScope, FutureScope, SmallScope, StrategyChoice},
+    Simplex,
+};
+use crate::{
+    setup_degraded_network,
+    utils::{link_peers, register, Action, Partition},
+    FuzzInput, FuzzMode, NetworkChannels, EPOCH, MAX_SLEEP_DURATION, N4F1C3, NAMESPACE,
+    PAGE_CACHE_SIZE, PAGE_SIZE,
+};
 use commonware_codec::{Decode, DecodeExt};
 use commonware_consensus::{
     simplex::{
         config,
-        mocks::{application, relay, reporter, twins},
+        mocks::{application, relay, reporter, twins::Strategy},
         types::{Certificate, Vote},
-        Engine, ForwardingPolicy,
+        Engine,
     },
     types::{Delta, Epoch, View},
     Monitor, Viewable,
 };
-use commonware_cryptography::ed25519::PublicKey as Ed25519PublicKey;
-use commonware_p2p::simulated::{Link, Oracle};
-use commonware_runtime::{deterministic, Clock};
-use commonware_utils::{NZUsize, NZU16};
-pub use minimmit::{
-    fuzz::fuzz as minimmit_fuzz, MinimmitBls12381MinPk, MinimmitBls12381MinSig,
-    MinimmitBls12381MultisigMinPk, MinimmitBls12381MultisigMinSig, MinimmitEd25519,
-    MinimmitSecp256r1,
+use commonware_cryptography::{
+    certificate::{mocks::Fixture, Scheme},
+    ed25519::PublicKey as Ed25519PublicKey,
+    sha256::Digest as Sha256Digest,
+    Sha256,
 };
-pub use simplex::{
-    fuzz::fuzz, SimplexBls12381MinPk, SimplexBls12381MinSig, SimplexBls12381MultisigMinPk,
-    SimplexBls12381MultisigMinSig, SimplexEd25519, SimplexSecp256r1,
+use commonware_p2p::{
+    simulated::{Config as NetworkConfig, Link, Network, Oracle, SplitOrigin, SplitTarget},
+    Recipients,
 };
-use std::{
-    num::{NonZeroU16, NonZeroUsize},
-    time::Duration,
+use commonware_parallel::Sequential;
+use commonware_runtime::{
+    buffer::paged::CacheRef, deterministic, Clock, IoBuf, Metrics, Runner, Spawner,
 };
-
-pub const EPOCH: u64 = 333;
-
-const PAGE_SIZE: NonZeroU16 = NZU16!(1024);
-const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(10);
-const FAULT_INJECTION_RATIO: u64 = 5;
-const MIN_NUMBER_OF_FAULTS: u64 = 2;
-const MIN_REQUIRED_CONTAINERS: u64 = 5;
-const MAX_REQUIRED_CONTAINERS: u64 = 50;
-const MAX_SLEEP_DURATION: Duration = Duration::from_secs(10);
-const NAMESPACE: &[u8] = b"consensus_fuzz";
-const MAX_RAW_BYTES: usize = 32_768;
-
-/// Network configuration for fuzz testing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Configuration {
-    /// Total number of nodes.
-    pub n: u32,
-    /// Number of faulty (Byzantine) nodes.
-    pub faults: u32,
-    /// Number of correct (honest) nodes.
-    pub correct: u32,
-}
-
-impl Configuration {
-    pub const fn new(n: u32, faults: u32, correct: u32) -> Self {
-        Self { n, faults, correct }
-    }
-
-    /// Returns true if this configuration can make progress (liveness).
-    pub fn can_finalize(&self) -> bool {
-        self.faults <= bounds::max_faults(self.n)
-    }
-}
-
-/// 4 nodes, 1 faulty, 3 correct (standard BFT config)
-pub const N4F1C3: Configuration = Configuration::new(4, 1, 3);
-/// 4 nodes, 3 faulty, 1 correct (adversarial majority, no liveness)
-pub const N4F3C1: Configuration = Configuration::new(4, 3, 1);
-/// 6 nodes, 1 faulty, 5 correct (standard Minimmit 5f+1 config)
-pub const N6F1C5: Configuration = Configuration::new(6, 1, 5);
-/// 6 nodes, 5 faulty, 1 correct (adversarial majority, no liveness for Minimmit)
-pub const N6F5C1: Configuration = Configuration::new(6, 5, 1);
-
-pub async fn setup_degraded_network<E: Clock>(
-    oracle: &mut Oracle<Ed25519PublicKey, E>,
-    participants: &[Ed25519PublicKey],
-) {
-    let Some(victim) = participants.last() else {
-        return;
-    };
-    let victim_idx = participants.len() - 1;
-    let degraded = Link {
-        latency: Duration::from_millis(50),
-        jitter: Duration::from_millis(50),
-        success_rate: 0.6,
-    };
-    for (peer_idx, peer) in participants.iter().enumerate() {
-        if peer_idx == victim_idx {
-            continue;
-        }
-        oracle.remove_link(victim.clone(), peer.clone()).await.ok();
-        oracle.remove_link(peer.clone(), victim.clone()).await.ok();
-        oracle
-            .add_link(victim.clone(), peer.clone(), degraded.clone())
-            .await
-            .unwrap();
-        oracle
-            .add_link(peer.clone(), victim.clone(), degraded.clone())
-            .await
-            .unwrap();
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct FuzzInput {
-    pub raw_bytes: Vec<u8>,
-    pub required_containers: u64,
-    pub degraded_network: bool,
-    pub configuration: Configuration,
-    pub partition: Partition,
-    pub strategy: StrategyChoice,
-}
-
-#[derive(Debug, Clone)]
-pub struct MinimmitFuzzInput(FuzzInput);
-
-impl From<MinimmitFuzzInput> for FuzzInput {
-    fn from(value: MinimmitFuzzInput) -> Self {
-        value.0
-    }
-}
-
-fn choose_configuration(
-    u: &mut arbitrary::Unstructured<'_>,
-    dominant: Configuration,
-    minority: Configuration,
-) -> arbitrary::Result<Configuration> {
-    Ok(match u.int_in_range(1..=100)? {
-        1..=95 => dominant,
-        _ => minority,
-    })
-}
-
-fn arbitrary_input_with_configuration(
-    u: &mut arbitrary::Unstructured<'_>,
-    configuration: Configuration,
-    degraded_configuration: Configuration,
-) -> arbitrary::Result<FuzzInput> {
-    // Bias towards Connected partition
-    let partition = match u.int_in_range(0..=99)? {
-        0..=79 => Partition::Connected,                    // 80%
-        80..=84 => Partition::Isolated,                    // 5%
-        85..=89 => Partition::TwoPartitionsWithByzantine,  // 5%
-        90..=94 => Partition::ManyPartitionsWithByzantine, // 5%
-        _ => Partition::Ring,                              // 5%
-    };
-
-    // Bias degraded networking - 1%
-    let degraded_network = partition == Partition::Connected
-        && configuration == degraded_configuration
-        && u.int_in_range(0..=99)? == 1;
-
-    let required_containers = u.int_in_range(MIN_REQUIRED_CONTAINERS..=MAX_REQUIRED_CONTAINERS)?;
-
-    // SmallScope mutations with round-based injections - 80%,
-    // AnyScope mutations - 10%,
-    // FutureScope mutations with round-based injections - 10%
-    let fault_rounds_bound = u.int_in_range(1..=required_containers)?;
-    let max_faults = fault_rounds_bound / FAULT_INJECTION_RATIO;
-    let min_faults = MIN_NUMBER_OF_FAULTS.min(fault_rounds_bound);
-    let fault_rounds = u.int_in_range(0..=max_faults)?.max(min_faults);
-    let strategy = match u.int_in_range(0..=9)? {
-        0 => StrategyChoice::AnyScope,
-        1 => StrategyChoice::FutureScope {
-            fault_rounds,
-            fault_rounds_bound,
-        },
-        _ => StrategyChoice::SmallScope {
-            fault_rounds,
-            fault_rounds_bound,
-        },
-    };
-
-    // Collect bytes for RNG
-    let remaining = u.len().min(MAX_RAW_BYTES);
-    let raw_bytes = u.bytes(remaining)?.to_vec();
-
-    Ok(FuzzInput {
-        raw_bytes,
-        partition,
-        configuration,
-        degraded_network,
-        required_containers,
-        strategy,
-    })
-}
-
-impl Arbitrary<'_> for FuzzInput {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let configuration = choose_configuration(u, N4F1C3, N4F3C1)?;
-        arbitrary_input_with_configuration(u, configuration, N4F1C3)
-    }
-}
-
-impl Arbitrary<'_> for MinimmitFuzzInput {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let configuration = choose_configuration(u, N6F1C5, N6F5C1)?;
-        let inner = arbitrary_input_with_configuration(u, configuration, N6F1C5)?;
-        Ok(Self(inner))
-    }
-}
-
-pub(crate) type NetworkChannels = (
-    (
-        commonware_p2p::simulated::Sender<Ed25519PublicKey, deterministic::Context>,
-        commonware_p2p::simulated::Receiver<Ed25519PublicKey>,
-    ),
-    (
-        commonware_p2p::simulated::Sender<Ed25519PublicKey, deterministic::Context>,
-        commonware_p2p::simulated::Receiver<Ed25519PublicKey>,
-    ),
-    (
-        commonware_p2p::simulated::Sender<Ed25519PublicKey, deterministic::Context>,
-        commonware_p2p::simulated::Receiver<Ed25519PublicKey>,
-    ),
-);
+use commonware_utils::{channel::mpsc::Receiver, FuzzRng, NZUsize};
+use futures::future::join_all;
+use std::{collections::HashMap, panic, sync::Arc, time::Duration};
 
 /// Common setup for fuzz tests: network, participants, links.
-async fn setup_network<P: simplex::Simplex>(
+async fn setup_network<P: Simplex>(
     context: &mut deterministic::Context,
     input: &FuzzInput,
 ) -> (
@@ -274,21 +92,21 @@ async fn setup_network<P: simplex::Simplex>(
 }
 
 /// Start a Disrupter with the given strategy and network channels.
-fn start_disrupter<P: simplex::Simplex>(
+fn start_disrupter<P: Simplex>(
     context: deterministic::Context,
     scheme: P::Scheme,
     strategy: &StrategyChoice,
     vote_network: (
-        impl commonware_p2p::Sender<PublicKey = Ed25519PublicKey>,
-        impl commonware_p2p::Receiver<PublicKey = Ed25519PublicKey>,
+        impl commonware_p2p::Sender<PublicKey = Ed25519PublicKey> + 'static,
+        impl commonware_p2p::Receiver<PublicKey = Ed25519PublicKey> + 'static,
     ),
     certificate_network: (
-        impl commonware_p2p::Sender<PublicKey = Ed25519PublicKey>,
-        impl commonware_p2p::Receiver<PublicKey = Ed25519PublicKey>,
+        impl commonware_p2p::Sender<PublicKey = Ed25519PublicKey> + 'static,
+        impl commonware_p2p::Receiver<PublicKey = Ed25519PublicKey> + 'static,
     ),
     resolver_network: (
-        impl commonware_p2p::Sender<PublicKey = Ed25519PublicKey>,
-        impl commonware_p2p::Receiver<PublicKey = Ed25519PublicKey>,
+        impl commonware_p2p::Sender<PublicKey = Ed25519PublicKey> + 'static,
+        impl commonware_p2p::Receiver<PublicKey = Ed25519PublicKey> + 'static,
     ),
 ) {
     match *strategy {
@@ -328,7 +146,7 @@ fn start_disrupter<P: simplex::Simplex>(
 }
 
 /// Spawn a Disrupter for a Byzantine node.
-fn spawn_disrupter<P: simplex::Simplex>(
+fn spawn_disrupter<P: Simplex>(
     context: deterministic::Context,
     scheme: P::Scheme,
     input: &FuzzInput,
@@ -346,37 +164,15 @@ fn spawn_disrupter<P: simplex::Simplex>(
 }
 
 /// Spawn an honest validator with application, reporter, and engine.
-#[allow(clippy::too_many_arguments)]
-fn spawn_honest_validator<
-    P,
-    PendingSender,
-    PendingReceiver,
-    RecoveredSender,
-    RecoveredReceiver,
-    ResolverSender,
-    ResolverReceiver,
->(
+fn spawn_honest_validator<P: Simplex>(
     context: deterministic::Context,
     oracle: &Oracle<Ed25519PublicKey, deterministic::Context>,
     participants: &[Ed25519PublicKey],
     scheme: P::Scheme,
     validator: Ed25519PublicKey,
     relay: Arc<relay::Relay<Sha256Digest, Ed25519PublicKey>>,
-    leader_timeout: Duration,
-    certification_timeout: Duration,
-    pending: (PendingSender, PendingReceiver),
-    recovered: (RecoveredSender, RecoveredReceiver),
-    resolver: (ResolverSender, ResolverReceiver),
-) -> reporter::Reporter<deterministic::Context, P::Scheme, P::Elector, Sha256Digest>
-where
-    P: simplex::Simplex,
-    PendingSender: commonware_p2p::Sender<PublicKey = Ed25519PublicKey>,
-    PendingReceiver: commonware_p2p::Receiver<PublicKey = Ed25519PublicKey>,
-    RecoveredSender: commonware_p2p::Sender<PublicKey = Ed25519PublicKey>,
-    RecoveredReceiver: commonware_p2p::Receiver<PublicKey = Ed25519PublicKey>,
-    ResolverSender: commonware_p2p::Sender<PublicKey = Ed25519PublicKey>,
-    ResolverReceiver: commonware_p2p::Receiver<PublicKey = Ed25519PublicKey>,
-{
+    channels: NetworkChannels,
+) -> reporter::Reporter<deterministic::Context, P::Scheme, P::Elector, Sha256Digest> {
     let elector = P::Elector::default();
     let reporter_cfg = reporter::Config {
         participants: participants.try_into().expect("public keys are unique"),
@@ -384,6 +180,8 @@ where
         elector: elector.clone(),
     };
     let reporter = reporter::Reporter::new(context.with_label("reporter"), reporter_cfg);
+
+    let (pending, recovered, resolver) = channels;
 
     let app_cfg = application::Config {
         hasher: Sha256::default(),
@@ -409,8 +207,8 @@ where
         partition: validator.to_string(),
         mailbox_size: 1024,
         epoch: Epoch::new(EPOCH),
-        leader_timeout,
-        certification_timeout,
+        leader_timeout: Duration::from_secs(1),
+        certification_timeout: Duration::from_secs(2),
         timeout_retry: Duration::from_secs(10),
         fetch_timeout: Duration::from_secs(1),
         activity_timeout: Delta::new(10),
@@ -420,7 +218,6 @@ where
         write_buffer: NZUsize!(1024 * 1024),
         page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
         strategy: Sequential,
-        forwarding: ForwardingPolicy::Disabled,
     };
     let engine = Engine::new(context.with_label("engine"), engine_cfg);
     engine.start(pending, recovered, resolver);
@@ -428,7 +225,7 @@ where
     reporter
 }
 
-fn run<P: simplex::Simplex>(input: FuzzInput) {
+fn run<P: Simplex>(input: FuzzInput) {
     let rng = FuzzRng::new(input.raw_bytes.clone());
     let cfg = deterministic::Config::new().with_rng(Box::new(rng));
     let executor = deterministic::Runner::new(cfg);
@@ -452,20 +249,16 @@ fn run<P: simplex::Simplex>(input: FuzzInput) {
         // Spawn honest validators
         for i in (config.faults as usize)..(config.n as usize) {
             let validator = participants[i].clone();
-            let (pending, recovered, resolver) = registrations.remove(&validator).unwrap();
+            let channels = registrations.remove(&validator).unwrap();
             let ctx = context.with_label(&format!("validator_{validator}"));
-            let reporter = spawn_honest_validator::<P, _, _, _, _, _, _>(
+            let reporter = spawn_honest_validator::<P>(
                 ctx,
                 &oracle,
                 &participants,
                 schemes[i].clone(),
                 validator,
                 relay.clone(),
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                pending,
-                recovered,
-                resolver,
+                channels,
             );
             reporters.push(reporter);
         }
@@ -492,28 +285,17 @@ fn run<P: simplex::Simplex>(input: FuzzInput) {
     });
 }
 
-fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
+fn run_with_twin_mutator<P: Simplex>(input: FuzzInput) {
     let rng = FuzzRng::new(input.raw_bytes.clone());
     let cfg = deterministic::Config::new().with_rng(Box::new(rng));
     let executor = deterministic::Runner::new(cfg);
 
     executor.start(|mut context| async move {
-        let (mut oracle, participants, schemes, mut registrations) =
+        let (oracle, participants, schemes, mut registrations) =
             setup_network::<P>(&mut context, &input).await;
         let participants: Arc<[_]> = participants.into();
 
-        link_peers(
-            &mut oracle,
-            participants.as_ref(),
-            Action::Update(Link {
-                latency: Duration::from_millis(500),
-                jitter: Duration::from_millis(500),
-                success_rate: 1.0,
-            }),
-            input.partition.filter(),
-        )
-        .await;
-
+        let strategy = Strategy::View;
         let relay = Arc::new(relay::Relay::new());
         let mut reporters = Vec::new();
         let config = input.configuration;
@@ -533,7 +315,7 @@ fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
                         return Some(recipients.clone());
                     };
                     let (primary, secondary) =
-                        twins::view_partitions(msg.view(), participants.as_ref());
+                        strategy.partitions(msg.view(), participants.as_ref());
                     match origin {
                         SplitOrigin::Primary => Some(Recipients::Some(primary)),
                         SplitOrigin::Secondary => Some(Recipients::Some(secondary)),
@@ -551,20 +333,26 @@ fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
                         return Some(recipients.clone());
                     };
                     let (primary, secondary) =
-                        twins::view_partitions(msg.view(), participants.as_ref());
+                        strategy.partitions(msg.view(), participants.as_ref());
                     match origin {
                         SplitOrigin::Primary => Some(Recipients::Some(primary)),
                         SplitOrigin::Secondary => Some(Recipients::Some(secondary)),
                     }
                 }
             };
+            let make_resolver_forwarder = || {
+                move |_: SplitOrigin, recipients: &Recipients<_>, _: &IoBuf| {
+                    Some(recipients.clone())
+                }
+            };
+
             let make_vote_router = || {
                 let participants = participants.clone();
                 move |(sender, message): &(_, IoBuf)| {
                     let Ok(msg) = Vote::<P::Scheme, Sha256Digest>::decode(message.clone()) else {
                         return SplitTarget::None;
                     };
-                    twins::view_route(msg.view(), sender, participants.as_ref())
+                    strategy.route(msg.view(), sender, participants.as_ref())
                 }
             };
             let make_certificate_router = || {
@@ -577,9 +365,11 @@ fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
                     ) else {
                         return SplitTarget::None;
                     };
-                    twins::view_route(msg.view(), sender, participants.as_ref())
+                    strategy.route(msg.view(), sender, participants.as_ref())
                 }
             };
+            let make_resolver_router = || move |(_sender, _message): &(_, IoBuf)| SplitTarget::Both;
+
             let (vote_sender, vote_receiver) = vote_network;
             let (certificate_sender, certificate_receiver) = certificate_network;
             let (resolver_sender, resolver_receiver) = resolver_network;
@@ -597,12 +387,13 @@ fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
                     context.with_label(&format!("recovered_split_{idx}")),
                     make_certificate_router(),
                 );
-            let (resolver_sender_primary, resolver_sender_secondary) = resolver_sender
-                .split_with(|_origin, recipients, _message| Some(recipients.clone()));
+            let (resolver_sender_primary, resolver_sender_secondary) =
+                resolver_sender.split_with(make_resolver_forwarder());
             let (resolver_receiver_primary, resolver_receiver_secondary) = resolver_receiver
-                .split_with(context.with_label(&format!("resolver_split_{idx}")), |_| {
-                    SplitTarget::Both
-                });
+                .split_with(
+                    context.with_label(&format!("resolver_split_{idx}")),
+                    make_resolver_router(),
+                );
 
             // Primary: legitimate engine
             let primary_label = format!("twin_{idx}_primary");
@@ -644,7 +435,7 @@ fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
                 mailbox_size: 1024,
                 epoch: Epoch::new(EPOCH),
                 leader_timeout: Duration::from_secs(1),
-                certification_timeout: Duration::from_millis(1_500),
+                certification_timeout: Duration::from_secs(2),
                 timeout_retry: Duration::from_secs(10),
                 fetch_timeout: Duration::from_secs(1),
                 activity_timeout: Delta::new(10),
@@ -654,7 +445,6 @@ fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache: CacheRef::from_pooler(&primary_context, PAGE_SIZE, PAGE_CACHE_SIZE),
                 strategy: Sequential,
-                forwarding: ForwardingPolicy::Disabled,
             };
             let engine = Engine::new(primary_context.with_label("engine"), engine_cfg);
             engine.start(
@@ -677,21 +467,17 @@ fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
         // Spawn honest validators
         for (idx, validator) in participants.iter().enumerate().skip(config.faults as usize) {
             let ctx = context.with_label(&format!("honest_{idx}"));
-            let (pending, recovered, resolver) = registrations
+            let channels = registrations
                 .remove(validator)
                 .expect("validator should be registered");
-            let reporter = spawn_honest_validator::<P, _, _, _, _, _, _>(
+            let reporter = spawn_honest_validator::<P>(
                 ctx,
                 &oracle,
                 participants.as_ref(),
                 schemes[idx].clone(),
                 validator.clone(),
                 relay.clone(),
-                Duration::from_secs(1),
-                Duration::from_millis(1_500),
-                pending,
-                recovered,
-                resolver,
+                channels,
             );
             reporters.push(reporter);
         }
@@ -718,47 +504,21 @@ fn run_with_twin_mutator<P: simplex::Simplex>(input: FuzzInput) {
     });
 }
 
-pub trait FuzzMode {
-    const TWIN: bool;
-}
+pub fn fuzz<P: Simplex, M: FuzzMode>(input: FuzzInput) {
+    let raw_bytes = input.raw_bytes.clone();
+    let run_result = if M::TWIN {
+        panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            run_with_twin_mutator::<P>(input)
+        }))
+    } else {
+        panic::catch_unwind(panic::AssertUnwindSafe(|| run::<P>(input)))
+    };
 
-pub struct Standard;
-
-impl FuzzMode for Standard {
-    const TWIN: bool = false;
-}
-
-pub struct Twinable;
-
-impl FuzzMode for Twinable {
-    const TWIN: bool = true;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_bytes(seed: u64) -> [u8; 512] {
-        let mut bytes = [0u8; 512];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            *byte = seed.wrapping_add(i as u64) as u8;
-        }
-        bytes
-    }
-
-    #[test]
-    fn minimmit_fuzz_input_uses_only_5f_plus_1_configurations() {
-        for seed in 0..512u64 {
-            let bytes = sample_bytes(seed);
-            let mut u = arbitrary::Unstructured::new(&bytes);
-            let input =
-                MinimmitFuzzInput::arbitrary(&mut u).expect("must generate minimmit fuzz input");
-            let input: FuzzInput = input.into();
-            assert!(
-                input.configuration == N6F1C5 || input.configuration == N6F5C1,
-                "unexpected minimmit configuration: {:?}",
-                input.configuration
-            );
+    match run_result {
+        Ok(()) => {}
+        Err(payload) => {
+            println!("Panicked with raw_bytes: {:?}", raw_bytes);
+            panic::resume_unwind(payload);
         }
     }
 }
