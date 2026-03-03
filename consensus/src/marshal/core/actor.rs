@@ -555,7 +555,7 @@ where
                         } else {
                             debug!(?round, "notarized block missing");
                             resolver
-                                .fetch(Request::<V::Commitment>::Notarized { round })
+                                .fetch(Request::<V::Commitment>::Notarized { round, commitment })
                                 .await;
                         }
                     }
@@ -811,12 +811,12 @@ where
                 };
                 response.send_lossy((finalization, block).encode());
             }
-            Request::Notarized { round } => {
-                let Some(notarization) = self.cache.get_notarization(round).await else {
+            Request::Notarized { round, commitment } => {
+                let digest = V::commitment_to_inner(commitment);
+                let Some(notarization) = self.cache.get_notarization(round, digest).await else {
                     debug!(?round, "notarization missing on request");
                     return;
                 };
-                let commitment = notarization.commitment();
                 let Some(block) = self.find_block_by_commitment(buffer, commitment).await else {
                     debug!(?commitment, "block missing on request");
                     return;
@@ -869,10 +869,20 @@ where
             // Attempt to fetch the block (with notarization) from the resolver.
             // If this is a valid view, this request should be fine to keep open
             // until resolution or pruning (even if the oneshot is canceled).
-            debug!(?round, ?digest, "requested block missing");
-            resolver
-                .fetch(Request::<V::Commitment>::Notarized { round })
-                .await;
+            let commitment = match key {
+                BlockSubscriptionKey::Commitment(commitment) => Some(commitment),
+                BlockSubscriptionKey::Digest(digest) => self
+                    .cache
+                    .get_notarization(round, digest)
+                    .await
+                    .map(|n| n.commitment()),
+            };
+            if let Some(commitment) = commitment {
+                debug!(?round, ?commitment, "requested block missing");
+                resolver
+                    .fetch(Request::<V::Commitment>::Notarized { round, commitment })
+                    .await;
+            }
         }
 
         // Register subscriber.
@@ -984,7 +994,7 @@ where
                 });
                 false
             }
-            Request::Notarized { round } => {
+            Request::Notarized { round, commitment } => {
                 let Some(scheme) = self.get_scheme_certificate_verifier(round.epoch()) else {
                     response.send_lossy(false);
                     return false;
@@ -1004,7 +1014,8 @@ where
                 };
 
                 if notarization.round() != round
-                    || V::commitment(&block) != notarization.commitment()
+                    || commitment != notarization.commitment()
+                    || V::commitment(&block) != commitment
                 {
                     response.send_lossy(false);
                     return false;
@@ -1335,7 +1346,7 @@ where
 
             // Cancel useless requests
             resolver
-                .retain(Request::<V::Commitment>::Notarized { round }.predicate())
+                .retain(Request::<V::Commitment>::Notarized { round, commitment }.predicate())
                 .await;
         }
     }
