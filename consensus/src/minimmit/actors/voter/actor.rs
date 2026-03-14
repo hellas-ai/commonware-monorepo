@@ -362,7 +362,7 @@ where
     async fn append_journal(&mut self, view: View, artifact: Artifact<S, D>) {
         if let Some(journal) = self.journal.as_mut() {
             journal
-                .append(view.get(), artifact)
+                .append(view.get(), &artifact)
                 .await
                 .expect("unable to append to journal");
         }
@@ -1302,7 +1302,7 @@ mod tests {
             let m_notarization = MNotarization::from_notarizes(&scheme, votes.iter(), &Sequential)
                 .expect("m-notarization");
             journal
-                .append(view.get(), Artifact::MNotarization(m_notarization.clone()))
+                .append(view.get(), &Artifact::MNotarization(m_notarization.clone()))
                 .await
                 .expect("append");
             journal.sync_all().await.expect("sync");

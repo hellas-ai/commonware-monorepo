@@ -109,6 +109,7 @@ impl crate::Listener for Listener {
 
         // Set SO_LINGER if configured
         if let Some(so_linger) = self.cfg.so_linger {
+            #[allow(deprecated)]
             if let Err(err) = stream.set_linger(Some(so_linger)) {
                 warn!(?err, "failed to set SO_LINGER");
             }
@@ -276,6 +277,7 @@ impl crate::Network for Network {
 
         // Set SO_LINGER if configured
         if let Some(so_linger) = self.cfg.so_linger {
+            #[allow(deprecated)]
             if let Err(err) = stream.set_linger(Some(so_linger)) {
                 warn!(?err, "failed to set SO_LINGER");
             }
