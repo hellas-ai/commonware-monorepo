@@ -27,7 +27,7 @@
 //! messages with that participant identity in that view.
 
 use crate::{
-    simplex::elector::{Config as ElectorConfig, Elector as Elected},
+    elector::{Config as ElectorConfig, Elector as Elected},
     types::{Participant, Round, View},
 };
 use commonware_cryptography::certificate::Scheme;
