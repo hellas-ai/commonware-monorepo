@@ -1248,4 +1248,44 @@ mod tests {
             metadata.destroy().await.unwrap();
         });
     }
+
+    #[test_traced]
+    fn test_recover_value_range_shrunk() {
+        // Regression test: data written with a wide codec range should be
+        // gracefully discarded (not panic) when reopened with a narrower range.
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            // Write data with an unbounded range
+            let wide_cfg = Config {
+                partition: "test-range-shrunk".into(),
+                codec_config: ((0..).into(), ()),
+            };
+            let mut metadata =
+                Metadata::<_, U64, Vec<u8>>::init(context.with_label("wide"), wide_cfg)
+                    .await
+                    .unwrap();
+
+            // Put a value that exceeds the narrow range we'll use later
+            let key = U64::new(1);
+            let big_value = vec![0xABu8; 28]; // 28 bytes
+            metadata.put(key.clone(), big_value);
+            metadata.sync().await.unwrap();
+            drop(metadata);
+
+            // Reopen with a narrow range (max 8 bytes) — must not panic
+            let narrow_cfg = Config {
+                partition: "test-range-shrunk".into(),
+                codec_config: ((0..=8).into(), ()),
+            };
+            let metadata =
+                Metadata::<_, U64, Vec<u8>>::init(context.with_label("narrow"), narrow_cfg)
+                    .await
+                    .unwrap();
+
+            // The old data should have been discarded
+            assert!(metadata.get(&key).is_none());
+
+            metadata.destroy().await.unwrap();
+        });
+    }
 }

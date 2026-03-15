@@ -201,13 +201,35 @@ impl<E: Clock + Storage + Metrics, K: Span, V: Codec> Metadata<E, K, V> {
         let mut cursor = u64::SIZE;
         while cursor < checksum_index {
             // Read key
-            let key = K::read(&mut buf.as_ref()[cursor..].as_ref())
-                .expect("unable to read key from blob");
+            let key = match K::read(&mut buf.as_ref()[cursor..].as_ref()) {
+                Ok(key) => key,
+                Err(err) => {
+                    warn!(
+                        blob = index,
+                        ?err,
+                        "unable to read key from blob: truncating"
+                    );
+                    blob.resize(0).await?;
+                    blob.sync().await?;
+                    return Ok((BTreeMap::new(), Wrapper::empty(blob)));
+                }
+            };
             cursor += key.encode_size();
 
             // Read value
-            let value = V::read_cfg(&mut buf.as_ref()[cursor..].as_ref(), codec_config)
-                .expect("unable to read value from blob");
+            let value = match V::read_cfg(&mut buf.as_ref()[cursor..].as_ref(), codec_config) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        blob = index,
+                        ?err,
+                        "unable to read value from blob: truncating"
+                    );
+                    blob.resize(0).await?;
+                    blob.sync().await?;
+                    return Ok((BTreeMap::new(), Wrapper::empty(blob)));
+                }
+            };
             lengths.insert(key.clone(), Info::new(cursor, value.encode_size()));
             cursor += value.encode_size();
             data.insert(key, value);
