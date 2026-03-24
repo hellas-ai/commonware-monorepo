@@ -240,6 +240,44 @@ impl<T: Translator, V: Eq + Send + Sync> Unordered for Index<T, V> {
     }
 }
 
+impl<T: Translator, V: Eq + Send + Sync> Index<T, V> {
+    /// Remove all values matching `predicate` across all keys, dropping empty keys.
+    pub fn retain(&mut self, predicate: impl Fn(&V) -> bool) {
+        self.map.retain(|_, record| {
+            // Prune matching values from the linked list tail first
+            let mut current = &mut record.next;
+            while let Some(node) = current {
+                if predicate(&node.value) {
+                    *current = node.next.take();
+                    self.items.dec();
+                    self.pruned.inc();
+                } else {
+                    current = &mut current.as_mut().unwrap().next;
+                }
+            }
+
+            // Check the head value
+            if predicate(&record.value) {
+                if let Some(next) = record.next.take() {
+                    // Promote next node to head
+                    *record = *next;
+                    self.items.dec();
+                    self.pruned.inc();
+                    true
+                } else {
+                    // Last value removed — drop the key
+                    self.keys.dec();
+                    self.items.dec();
+                    self.pruned.inc();
+                    false
+                }
+            } else {
+                true
+            }
+        });
+    }
+}
+
 impl<T: Translator, V: Eq + Send + Sync> Drop for Index<T, V> {
     /// To avoid stack overflow on keys with many collisions, we implement an iterative drop (in
     /// lieu of Rust's default recursive drop).

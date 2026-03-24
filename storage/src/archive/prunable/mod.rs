@@ -492,7 +492,7 @@ mod tests {
             let buffer = context.encode();
             assert!(buffer.contains("items_tracked 3"));
             assert!(buffer.contains("indices_pruned_total 2"));
-            assert!(buffer.contains("pruned_total 0")); // no lazy cleanup yet
+            assert!(buffer.contains("pruned_total 2")); // keys for pruned indices are cleaned up
 
             // Try to prune older section
             archive.prune(2).await.expect("Failed to prune");
@@ -512,9 +512,9 @@ mod tests {
 
             // Check metrics
             let buffer = context.encode();
-            assert!(buffer.contains("items_tracked 4")); // lazily remove one, add one
+            assert!(buffer.contains("items_tracked 4")); // pruned two, add one
             assert!(buffer.contains("indices_pruned_total 2"));
-            assert!(buffer.contains("pruned_total 1"));
+            assert!(buffer.contains("pruned_total 2")); // both pruned keys cleaned up eagerly
         });
     }
 

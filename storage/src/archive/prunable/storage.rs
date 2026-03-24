@@ -405,6 +405,9 @@ impl<T: Translator, E: BufferPooler + Storage + Metrics, K: Array, V: CodecShare
             self.indices_pruned.inc();
         }
 
+        // Remove all keys whose view index was pruned
+        self.keys.retain(|v| *v < min);
+
         // Remove all keys from interval tree less than min
         if min > 0 {
             self.intervals.remove(0, min - 1);
