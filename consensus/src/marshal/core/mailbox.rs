@@ -98,7 +98,7 @@ pub(crate) enum Message<V: Variant> {
         /// The commitment of the block to forward.
         commitment: V::Commitment,
         /// The peers to forward the block to.
-        peers: Vec<S::PublicKey>,
+        peers: Vec<<<V::Consensus as ConsensusEngine>::Scheme as Scheme>::PublicKey>,
     },
     /// A notification that a block has been verified by the application.
     Verified {
@@ -326,7 +326,7 @@ impl<V: Variant> Mailbox<V> {
     }
 
     /// Forward a block to a set of peers.
-    pub async fn forward(&self, round: Round, commitment: V::Commitment, peers: Vec<S::PublicKey>) {
+    pub async fn forward(&self, round: Round, commitment: V::Commitment, peers: Vec<<<V::Consensus as ConsensusEngine>::Scheme as Scheme>::PublicKey>) {
         self.sender
             .send_lossy(Message::Forward {
                 round,

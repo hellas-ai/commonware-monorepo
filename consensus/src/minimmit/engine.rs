@@ -27,7 +27,7 @@ where
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
     A: Automaton<Context = Context<D, S::PublicKey>, Digest = D>,
-    R: Relay<Digest = D>,
+    R: Relay<Digest = D, Plan: Default>,
     F: Reporter<Activity = Activity<S, D>>,
     T: Strategy,
 {
@@ -51,7 +51,7 @@ where
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
     A: Automaton<Context = Context<D, S::PublicKey>, Digest = D>,
-    R: Relay<Digest = D>,
+    R: Relay<Digest = D, Plan: Default>,
     F: Reporter<Activity = Activity<S, D>>,
     T: Strategy,
 {

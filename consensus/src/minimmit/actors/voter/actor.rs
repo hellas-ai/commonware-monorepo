@@ -155,7 +155,7 @@ where
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
     A: Automaton<Digest = D, Context = Context<D, S::PublicKey>>,
-    R: Relay<Digest = D>,
+    R: Relay<Digest = D, Plan: Default>,
     F: Reporter<Activity = Activity<S, D>>,
     T: Strategy,
 {
@@ -209,7 +209,7 @@ where
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
     A: Automaton<Digest = D, Context = Context<D, S::PublicKey>>,
-    R: Relay<Digest = D>,
+    R: Relay<Digest = D, Plan: Default>,
     F: Reporter<Activity = Activity<S, D>>,
     T: Strategy,
 {
@@ -639,7 +639,7 @@ where
                     let actions = state.proposed(proposal.clone());
 
                     if !actions.is_empty() {
-                        self.relay.broadcast(proposal.payload).await;
+                        self.relay.broadcast(proposal.payload, Default::default()).await;
                     }
 
                     for action in actions {
@@ -1096,8 +1096,10 @@ mod tests {
 
     impl Relay for NoopRelay {
         type Digest = Sha256Digest;
+        type PublicKey = Ed25519PublicKey;
+        type Plan = ();
 
-        async fn broadcast(&mut self, _payload: Self::Digest) {}
+        async fn broadcast(&mut self, _payload: Self::Digest, _plan: Self::Plan) {}
     }
 
     #[derive(Clone)]
@@ -1906,7 +1908,9 @@ mod tests {
             )
             .expect("nullification");
 
-            assert!(mailbox.resolved_certificate(Certificate::Nullification(nullification)));
+            mailbox
+                .resolved_certificate(Certificate::Nullification(nullification))
+                .await;
 
             for _ in 0..20 {
                 if certificate_sender.len() > 0 {

@@ -66,7 +66,7 @@ where
     B: Block,
     C: ConsensusEngine<Commitment = <B as Digestible>::Digest>,
 {
-    type PublicKey = K;
+    type PublicKey = <<C as ConsensusEngine>::Scheme as CertificateScheme>::PublicKey;
     type CachedBlock = B;
 
     async fn find_by_digest(&self, digest: B::Digest) -> Option<Self::CachedBlock> {
@@ -94,7 +94,7 @@ where
 
     async fn finalized(&self, _commitment: B::Digest) {}
 
-    async fn send(&self, _round: Round, block: B, recipients: Recipients<K>) {
+    async fn send(&self, _round: Round, block: B, recipients: Recipients<<<C as ConsensusEngine>::Scheme as CertificateScheme>::PublicKey>) {
         let _peers = Broadcaster::broadcast(self, recipients, block).await;
     }
 }

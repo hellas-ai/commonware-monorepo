@@ -367,8 +367,10 @@ pub(crate) fn interesting(
 }
 
 /// Describes how a payload should be broadcast to the network.
+#[derive(Default)]
 pub enum Plan<P: PublicKey> {
     /// Initial broadcast of a newly proposed block to all participants.
+    #[default]
     Propose,
     /// Forward a block to a specific set of peers.
     Forward {

@@ -772,10 +772,8 @@ fn generate_scenarios(
 mod tests {
     use super::*;
     use crate::{
-        simplex::{
-            elector::{Config as ElectorConfig, RoundRobin},
-            scheme::ed25519,
-        },
+        elector::{Config as ElectorConfig, RoundRobin},
+        simplex::scheme::ed25519,
         types::Epoch,
     };
     use commonware_cryptography::{ed25519::PrivateKey, Sha256, Signer};

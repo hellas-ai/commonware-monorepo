@@ -1,12 +1,8 @@
 //! Mailbox and message types for the voter actor.
 
-use crate::{
-    minimmit::types::{Certificate, Notarize, Nullify, Proposal},
-    Viewable,
-};
+use crate::minimmit::types::{Certificate, Notarize, Nullify, Proposal};
 use commonware_cryptography::{certificate::Scheme, Digest};
 use commonware_utils::channel::{fallible::AsyncFallibleExt, mpsc};
-use tracing::warn;
 
 /// Messages that can be sent to the voter actor.
 pub enum Message<S: Scheme, D: Digest> {
@@ -64,17 +60,11 @@ impl<S: Scheme, D: Digest> Mailbox<S, D> {
 
     /// Send a resolved or recovered certificate to the voter.
     ///
-    /// Returns `true` if the message was successfully queued, `false` if the
-    /// mailbox was full (message is dropped with a warning).
-    pub fn resolved_certificate(&self, certificate: Certificate<S, D>) -> bool {
-        let view = certificate.view();
-        if !self
-            .sender
-            .try_send_lossy(Message::Verified(certificate, true))
-        {
-            warn!(%view, "voter mailbox full, dropping resolved certificate");
-            return false;
-        }
-        true
+    /// Awaits capacity in the voter mailbox, providing natural backpressure
+    /// to the resolver during catch-up.
+    pub async fn resolved_certificate(&self, certificate: Certificate<S, D>) {
+        self.sender
+            .send_lossy(Message::Verified(certificate, true))
+            .await;
     }
 }

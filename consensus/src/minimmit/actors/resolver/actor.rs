@@ -24,7 +24,7 @@ use commonware_utils::{
     sequence::U64,
 };
 use rand_core::CryptoRngCore;
-use std::{collections::BTreeSet, time::Duration};
+use std::time::Duration;
 use tracing::debug;
 
 /// Resolver actor for Minimmit consensus.
@@ -50,7 +50,6 @@ where
     fetch_timeout: Duration,
 
     state: State<S, D>,
-    pending_refetch: BTreeSet<View>,
 
     mailbox_receiver: mpsc::Receiver<MailboxMessage<S, D>>,
 }
@@ -78,7 +77,6 @@ where
                 fetch_timeout: cfg.fetch_timeout,
 
                 state: State::new(cfg.fetch_concurrent),
-                pending_refetch: BTreeSet::new(),
 
                 mailbox_receiver: receiver,
             },
@@ -141,7 +139,6 @@ where
             Some(message) = self.mailbox_receiver.recv() else break => {
                 match message {
                     MailboxMessage::Certificate(certificate) => {
-                        self.pending_refetch.remove(&certificate.view());
                         self.state.handle(certificate, &mut resolver).await;
                     }
                 }
@@ -244,18 +241,9 @@ where
                     response.send_lossy(false);
                     return;
                 };
-                // Keep resolver semantics: valid certificate means successful delivery.
-                // If the voter mailbox is full, re-fetch so we can retry local handoff.
-                if !voter.resolved_certificate(parsed.clone()) {
-                    debug!(%view, "voter mailbox full, re-fetching resolved certificate");
-                    response.send_lossy(true);
-                    if self.pending_refetch.insert(view) {
-                        resolver.fetch(view.into()).await;
-                    }
-                    return;
-                }
-
-                self.pending_refetch.remove(&view);
+                // Send to voter — awaits capacity, providing natural backpressure
+                // during catch-up instead of dropping and re-fetching in a loop.
+                voter.resolved_certificate(parsed.clone()).await;
 
                 // Process message
                 response.send_lossy(true);
@@ -368,50 +356,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct CountingResolver {
-        fetched: Arc<Mutex<Vec<U64>>>,
-    }
-
-    impl CountingResolver {
-        fn fetch_count(&self, key: U64) -> usize {
-            self.fetched.lock().iter().filter(|k| *k == &key).count()
-        }
-    }
-
-    impl Resolver for CountingResolver {
-        type Key = U64;
-        type PublicKey = Ed25519PublicKey;
-
-        async fn fetch(&mut self, key: U64) {
-            self.fetched.lock().push(key);
-        }
-
-        async fn fetch_all(&mut self, keys: Vec<U64>) {
-            self.fetched.lock().extend(keys);
-        }
-
-        async fn fetch_targeted(&mut self, key: U64, _targets: NonEmptyVec<Self::PublicKey>) {
-            self.fetched.lock().push(key);
-        }
-
-        async fn fetch_all_targeted(&mut self, requests: Vec<(U64, NonEmptyVec<Self::PublicKey>)>) {
-            self.fetched
-                .lock()
-                .extend(requests.into_iter().map(|(key, _)| key));
-        }
-
-        async fn cancel(&mut self, _key: U64) {}
-
-        async fn clear(&mut self) {
-            self.fetched.lock().clear();
-        }
-
-        async fn retain(&mut self, predicate: impl Fn(&Self::Key) -> bool + Send + 'static) {
-            self.fetched.lock().retain(predicate);
-        }
-    }
-
     fn ed25519_fixture() -> (Vec<TestScheme>, TestScheme) {
         let mut rng = test_rng();
         let Fixture {
@@ -447,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn retries_when_voter_mailbox_is_full() {
+    fn blocks_until_voter_has_capacity() {
         let executor = deterministic::Runner::default();
         executor.start(|context: deterministic::Context| async move {
             let (schemes, verifier) = ed25519_fixture();
@@ -467,12 +411,16 @@ mod tests {
             };
             let (mut actor, _mailbox) = Actor::new(context.with_label("resolver_actor"), cfg);
 
+            // Create a voter mailbox of size 1 and fill it
             let (voter_tx, mut voter_rx) = mpsc::channel(1);
             let mut voter = voter::Mailbox::new(voter_tx);
             voter.proposal(build_proposal(View::new(1))).await;
 
             let mut resolver = MockResolver::default();
             let (response, receiver) = oneshot::channel();
+
+            // Drain the voter mailbox to make room, then deliver
+            assert!(voter_rx.try_recv().is_ok(), "expected pre-filled proposal");
 
             actor
                 .handle_resolver(
@@ -486,72 +434,19 @@ mod tests {
                 )
                 .await;
 
+            // Certificate was delivered (not dropped) and state was updated
             assert!(receiver.await.expect("deliver response"));
-            assert!(voter_rx.try_recv().is_ok(), "expected pre-filled proposal");
             assert!(
-                voter_rx.try_recv().is_err(),
-                "resolved certificate must not be enqueued when mailbox is full"
+                voter_rx.try_recv().is_ok(),
+                "resolved certificate must be enqueued in voter mailbox"
             );
             assert!(
-                actor.state.get(view).is_none(),
-                "resolver state must not advance on dropped voter delivery"
+                actor.state.get(view).is_some(),
+                "resolver state must advance after successful delivery"
             );
-            assert_eq!(
-                resolver.fetched(),
-                vec![view.get()],
-                "resolver must retry fetching the dropped certificate view"
-            );
-        });
-    }
-
-    #[test]
-    fn does_not_refetch_same_view_repeatedly_while_voter_full() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context: deterministic::Context| async move {
-            let (schemes, verifier) = ed25519_fixture();
-            let certificate =
-                Certificate::MNotarization(build_m_notarization(&schemes, &verifier, View::new(3)));
-            let view = certificate.view();
-            let data = certificate.encode();
-
-            let cfg = Config {
-                scheme: verifier.clone(),
-                blocker: NoopBlocker,
-                strategy: Sequential,
-                epoch: EPOCH,
-                mailbox_size: 8,
-                fetch_concurrent: 2,
-                fetch_timeout: Duration::from_millis(10),
-            };
-            let (mut actor, _mailbox) = Actor::new(context.with_label("resolver_actor"), cfg);
-
-            let (voter_tx, _voter_rx) = mpsc::channel(1);
-            let mut voter = voter::Mailbox::new(voter_tx);
-            voter.proposal(build_proposal(View::new(1))).await;
-
-            let mut resolver = CountingResolver::default();
-
-            for _ in 0..2 {
-                let (response, receiver) = oneshot::channel();
-                actor
-                    .handle_resolver(
-                        HandlerMessage::Deliver {
-                            view,
-                            data: data.clone(),
-                            response,
-                        },
-                        &mut voter,
-                        &mut resolver,
-                    )
-                    .await;
-                assert!(receiver.await.expect("deliver response"));
-            }
-
-            let key = view.into();
-            assert_eq!(
-                resolver.fetch_count(key),
-                1,
-                "resolver should fetch a full mailbox view at most once until handoff succeeds"
+            assert!(
+                resolver.fetched().is_empty(),
+                "resolver must not re-fetch when backpressure is used"
             );
         });
     }

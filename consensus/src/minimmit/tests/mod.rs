@@ -2188,7 +2188,7 @@ mod engine_tests {
         minimmit::{
             config::Config,
             engine::Engine,
-            mocks::{application, relay, reporter, twins::Strategy},
+            mocks::{application, relay, reporter},
             scheme::{bls12381_multisig, bls12381_threshold, ed25519, secp256r1, Scheme},
             types::{Certificate, Vote},
         },
@@ -2228,6 +2228,65 @@ mod engine_tests {
     const PAGE_SIZE: NonZeroU16 = NZU16!(1024);
     const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(10);
     const TEST_QUOTA: Quota = Quota::per_second(NonZeroU32::MAX);
+
+    /// Partition strategy for twins tests.
+    #[derive(Clone, Copy)]
+    enum Strategy {
+        /// Split at `view % n` boundary (rotates with each view).
+        View,
+        /// Split at a fixed index.
+        Fixed(usize),
+        /// Isolate a single participant into a solo partition.
+        Isolate(usize),
+        /// No partition — everyone sees everything.
+        Broadcast,
+        /// Shuffle-based partition: split at `(view * 7 + 3) % n`.
+        Shuffle,
+    }
+
+    impl Strategy {
+        fn partitions<P: Clone>(&self, view: View, participants: &[P]) -> (Vec<P>, Vec<P>) {
+            let n = participants.len();
+            let split = match self {
+                Self::View => (view.get() as usize) % n,
+                Self::Fixed(idx) => *idx % n,
+                Self::Isolate(idx) => {
+                    let idx = *idx % n;
+                    let mut primary = Vec::with_capacity(n - 1);
+                    let mut secondary = Vec::with_capacity(1);
+                    for (i, p) in participants.iter().enumerate() {
+                        if i == idx {
+                            secondary.push(p.clone());
+                        } else {
+                            primary.push(p.clone());
+                        }
+                    }
+                    return (primary, secondary);
+                }
+                Self::Broadcast => return (participants.to_vec(), participants.to_vec()),
+                Self::Shuffle => ((view.get() as usize).wrapping_mul(7).wrapping_add(3)) % n,
+            };
+            let (primary, secondary) = participants.split_at(split);
+            (primary.to_vec(), secondary.to_vec())
+        }
+
+        fn route<P: Clone + PartialEq>(
+            &self,
+            view: View,
+            sender: &P,
+            participants: &[P],
+        ) -> SplitTarget {
+            let (primary, secondary) = self.partitions(view, participants);
+            let in_primary = primary.contains(sender);
+            let in_secondary = secondary.contains(sender);
+            match (in_primary, in_secondary) {
+                (true, true) => SplitTarget::Both,
+                (true, false) => SplitTarget::Primary,
+                (false, true) => SplitTarget::Secondary,
+                (false, false) => SplitTarget::Both,
+            }
+        }
+    }
 
     /// Register a validator with the oracle.
     async fn register_validator(

@@ -538,8 +538,19 @@ where
 mod tests {
     use super::Inline;
     use crate::{
-        marshal::core::SimplexConsensus, simplex, simplex::types::Context, Automaton, Block,
-        CertifiableAutomaton, Relay, VerifyingApplication,
+        marshal::{
+            core::SimplexConsensus,
+            mocks::verifying::MockVerifyingApp,
+            tests::{
+                default_leader, make_raw_block, setup_network, Ctx, StandardSimplexHarness,
+                TestHarness, B, BLOCKS_PER_EPOCH, NAMESPACE, NUM_VALIDATORS, S, V,
+            },
+        },
+        simplex,
+        simplex::scheme::bls12381_threshold::vrf as bls12381_threshold_vrf,
+        simplex::types::Context,
+        types::{Epoch, FixedEpocher, Height, Round, View},
+        Automaton, Block, CertifiableAutomaton, Relay, VerifyingApplication,
     };
     use commonware_cryptography::{
         certificate::{mocks::Fixture, ConstantProvider, Scheme},
@@ -587,7 +598,7 @@ mod tests {
             } = bls12381_threshold_vrf::fixture::<V, _>(&mut context, NAMESPACE, NUM_VALIDATORS);
 
             let me = participants[0].clone();
-            let setup = StandardHarness::setup_validator(
+            let setup = StandardSimplexHarness::setup_validator(
                 context.with_label("validator_0"),
                 &mut oracle,
                 me.clone(),
@@ -663,7 +674,7 @@ mod tests {
             } = bls12381_threshold_vrf::fixture::<V, _>(&mut context, NAMESPACE, NUM_VALIDATORS);
 
             let me = participants[0].clone();
-            let setup = StandardHarness::setup_validator(
+            let setup = StandardSimplexHarness::setup_validator(
                 context.with_label("validator_0"),
                 &mut oracle,
                 me.clone(),
