@@ -1036,6 +1036,7 @@ where
         let min_view = self.last_finalized;
         self.views.retain(|v, _| *v >= min_view);
         self.trackers.retain(|v, _| *v >= min_view);
+        self.leaders.retain(|v, _| *v >= min_view);
         self.ancestry.prune_before(min_view);
     }
 
